@@ -17,7 +17,7 @@ use bdk_coin_select::{
 };
 use frostsnap_core::{
     bitcoin_transaction::{LocalSpk, PushInput, TransactionTemplate},
-    tweak::{BitcoinAccountKeychain, BitcoinBip32Path},
+    tweak::{BitcoinAccountKeychain, BitcoinBip32Path, Keychain},
     MasterAppkey,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -298,6 +298,11 @@ impl CoordSuperWallet {
     /// than the 1 sat/vB relay floor because this runs where no feerate exists (a passive,
     /// offline-capable wallet-home getter) and the floor would nudge over coins whose rescue is
     /// only theoretically broadcastable.
+    ///
+    /// Change only. We caused the internal gap: change allocation put it there and the user
+    /// cannot see it. An external gap is probably user behaviour, and sweeping it to internal
+    /// only makes the problem reappear on the next receive. [`Self::plan_send`] still sweeps
+    /// both.
     fn stranded_rescuable(
         &mut self,
         master_appkey: MasterAppkey,
@@ -317,6 +322,7 @@ impl CoordSuperWallet {
                 .unzip();
         self.gap_stranded(master_appkey, &keychain_indices)
             .into_iter()
+            .filter(|&position| keychain_indices[position].0 .1.keychain == Keychain::Internal)
             .filter_map(|position| {
                 let candidate = Candidate {
                     input_count: 1,
@@ -576,6 +582,12 @@ mod test {
         /// Deliver a confirmed external payment the way a sync would.
         fn fund(&mut self, index: u32, value: u64, height: u32) -> OutPoint {
             self.fund_keychain(BitcoinAccountKeychain::external(), index, value, height)
+        }
+
+        /// Deliver a confirmed payment to the internal keychain: where change lands, and so
+        /// the only keychain the consolidation nudge speaks about.
+        fn fund_internal(&mut self, index: u32, value: u64, height: u32) -> OutPoint {
+            self.fund_keychain(BitcoinAccountKeychain::internal(), index, value, height)
         }
 
         /// Deliver a confirmed payment to either keychain. Change lands on the internal one,
@@ -847,13 +859,13 @@ mod test {
     #[test]
     fn gap_stranded_value_counts_only_rescuable_coins() {
         let mut f = Fixture::new();
-        f.fund(0, 1_000_000, 100);
+        f.fund_internal(0, 1_000_000, 100);
         assert_eq!(f.wallet.gap_stranded_value(f.master_appkey), (0, 0));
 
-        f.fund(30, 500_000, 101);
+        f.fund_internal(30, 500_000, 101);
         // Stranded and above its spend cost at the 1 sat/vB relay floor, but below it at the
         // summary's 10 sat/vB bar — pins that the bar is 10, not merely relayable.
-        f.fund(45, 300, 102);
+        f.fund_internal(45, 300, 102);
         assert_eq!(f.wallet.gap_stranded_value(f.master_appkey), (1, 500_000));
     }
 
@@ -862,9 +874,12 @@ mod test {
     #[test]
     fn consolidation_spends_exactly_the_nudged_coins_into_one_change_output() {
         let mut f = Fixture::new();
-        f.fund(0, 1_000_000, 100);
-        let stranded_ext = f.fund(30, 500_000, 101);
-        let stranded_int = f.fund_keychain(BitcoinAccountKeychain::internal(), 25, 200_000, 102);
+        f.fund_internal(0, 1_000_000, 100);
+        let stranded_a = f.fund_internal(30, 500_000, 101);
+        let stranded_b = f.fund_internal(60, 200_000, 102);
+        // Stranded on the external keychain too, and deliberately not part of the set: the
+        // nudge speaks only about change.
+        f.fund(30, 900_000, 103);
         let revealed_before = f.last_revealed_internal();
 
         let plan = f.wallet.plan_consolidate(f.master_appkey, 10.0).unwrap();
@@ -874,7 +889,7 @@ mod test {
             .iter()
             .map(|&(_, outpoint)| outpoint)
             .collect();
-        assert_eq!(planned, BTreeSet::from([stranded_ext, stranded_int]));
+        assert_eq!(planned, BTreeSet::from([stranded_a, stranded_b]));
         assert!(plan.recipients.is_empty());
         let change = plan.change_value.expect("the one output is change");
         assert_eq!(
@@ -927,8 +942,9 @@ mod test {
     #[test]
     fn consolidation_refuses_a_sub_dust_result() {
         let mut f = Fixture::new();
-        f.fund(0, 1_000_000, 100);
-        f.fund(21, 700, 101); // above the nudge bar, below one input+output of fee at 10 sat/vB
+        f.fund_internal(0, 1_000_000, 100);
+        // above the nudge bar, below one input+output of fee at 10 sat/vB
+        f.fund_internal(21, 700, 101);
 
         assert_eq!(f.wallet.gap_stranded_value(f.master_appkey), (1, 700));
         let err = f
@@ -944,9 +960,9 @@ mod test {
     #[test]
     fn consolidation_refuses_a_dust_change_output() {
         let mut f = Fixture::new();
-        f.fund(0, 1_000_000, 100);
+        f.fund_internal(0, 1_000_000, 100);
         // 1_400 covers the 1_110 sat fee and leaves 290: a real output, below the relay floor.
-        f.fund(21, 1_400, 101);
+        f.fund_internal(21, 1_400, 101);
         assert_eq!(f.wallet.gap_stranded_value(f.master_appkey), (1, 1_400));
 
         let err = f
@@ -958,10 +974,38 @@ mod test {
         // Same coin, same fee, enough left over: the refusal above was the floor and not a
         // shortfall.
         let mut f = Fixture::new();
-        f.fund(0, 1_000_000, 100);
-        f.fund(21, 1_600, 101);
+        f.fund_internal(0, 1_000_000, 100);
+        f.fund_internal(21, 1_600, 101);
         let plan = f.wallet.plan_consolidate(f.master_appkey, 10.0).unwrap();
         assert_eq!(plan.change_value, Some(490));
+    }
+
+    /// The split the nudge rests on: an external straggler is swept for free by a payment
+    /// being made anyway, rather than being prompted to the user.
+    #[test]
+    fn an_external_straggler_is_swept_but_never_nudged() {
+        let mut f = Fixture::new();
+        f.fund(0, 1_000_000, 100);
+        let external = f.fund(30, 500_000, 101);
+
+        assert_eq!(
+            f.wallet.gap_stranded_value(f.master_appkey),
+            (0, 0),
+            "nothing to prompt about"
+        );
+        assert!(
+            f.wallet.plan_consolidate(f.master_appkey, 10.0).is_err(),
+            "and nothing for the remedy to do"
+        );
+
+        let plan = f
+            .wallet
+            .plan_send(f.master_appkey, [(f.recipient.clone(), Some(10_000))], 10.0)
+            .unwrap();
+        assert!(
+            plan.selected.iter().any(|&(_, o)| o == external),
+            "but a payment being made anyway still sweeps it"
+        );
     }
 
     /// Committing flows through the ordinary change allocation, and broadcasting the result is
@@ -969,9 +1013,9 @@ mod test {
     #[test]
     fn committed_consolidation_clears_the_nudge() {
         let mut f = Fixture::new();
-        f.fund(0, 1_000_000, 100);
-        f.fund(30, 500_000, 101);
-        f.fund(60, 400_000, 102);
+        f.fund_internal(0, 1_000_000, 100);
+        f.fund_internal(30, 500_000, 101);
+        f.fund_internal(60, 400_000, 102);
         assert_eq!(f.wallet.gap_stranded_value(f.master_appkey), (2, 900_000));
 
         let plan = f.wallet.plan_consolidate(f.master_appkey, 10.0).unwrap();
@@ -979,8 +1023,9 @@ mod test {
         assert_eq!(template.fee(), Some(plan.fee), "fee shown is fee paid");
         assert_eq!(
             f.last_revealed_internal(),
-            Some(0),
-            "the single output rides the ordinary change allocation"
+            Some(60),
+            "the single output rides the ordinary change allocation: a revealed-unused index, \
+             no fresh reveal"
         );
 
         let tx = template.to_rust_bitcoin_tx();
@@ -1010,11 +1055,11 @@ mod test {
     #[test]
     fn a_coin_effective_negative_at_the_plan_rate_is_still_rescued() {
         let mut f = Fixture::new();
-        f.fund(0, 1_000_000, 100);
-        f.fund(30, 500_000, 101);
+        f.fund_internal(0, 1_000_000, 100);
+        f.fund_internal(30, 500_000, 101);
         // ~575 sats of input cost at 10 sat/vB, ~2875 at 50: admitted by the nudge, negative
         // at the plan rate.
-        let marginal = f.fund(51, 1_500, 102);
+        let marginal = f.fund_internal(51, 1_500, 102);
         assert_eq!(f.wallet.gap_stranded_value(f.master_appkey), (2, 501_500));
 
         let plan = f.wallet.plan_consolidate(f.master_appkey, 50.0).unwrap();

@@ -20,6 +20,9 @@ import 'package:frostsnap/wallet_tx_details.dart';
 /// consolidates those coins automatically (`plan_send` force-selects them); this banner exists
 /// so the user knows one is worth making. Mounting it also kicks the recovery scan, so change
 /// the wallet can't yet see is attributed first and then counted here.
+///
+/// Change only: an external gap is probably user behaviour, and sweeping it to internal only
+/// makes the problem reappear on the next receive.
 class StrandedCoinsBanner extends StatefulWidget {
   const StrandedCoinsBanner({super.key});
 
