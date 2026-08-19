@@ -180,6 +180,12 @@ enum Transition {
     CDeleteKey {
         key_index: usize,
     },
+    /// Inject a message an honest device would never send: signature shares naming a
+    /// signing session the coordinator never issued.
+    DBadSignatureShare {
+        device_index: usize,
+        session_id: [u8; 32],
+    },
 }
 
 impl ReferenceStateMachine for RefState {
@@ -404,6 +410,21 @@ impl ReferenceStateMachine for RefState {
             trans.push((1, to_delete));
         }
 
+        // Shares for a session id we never issued. Interesting in every state, so it's
+        // unconditional, but rare enough not to crowd out the valid transitions.
+        let bad_share = (
+            0..state.n_devices(),
+            array::uniform::<_, 32>(0..=u8::MAX).no_shrink(),
+        )
+            .prop_map(
+                |(device_index, session_id)| Transition::DBadSignatureShare {
+                    device_index,
+                    session_id,
+                },
+            )
+            .boxed();
+        trans.push((1, bad_share));
+
         proptest::strategy::Union::new_weighted(trans).boxed()
     }
 
@@ -491,6 +512,9 @@ impl ReferenceStateMachine for RefState {
                 None => false,
             },
             &Transition::CDeleteKey { key_index } => key_index < state.finished_keygens.len(),
+            &Transition::DBadSignatureShare { device_index, .. } => {
+                device_index < state.n_devices()
+            }
         }
     }
 
@@ -606,6 +630,8 @@ impl ReferenceStateMachine for RefState {
                 }
                 state.finished_keygens[key_index].deleted = true;
             }
+            // A message the coordinator rejects must leave the state alone.
+            Transition::DBadSignatureShare { .. } => {}
         }
 
         state
@@ -614,6 +640,8 @@ impl ReferenceStateMachine for RefState {
 
 /// This tests that all valid transitions can occur without panicking. This has marginal benefit for
 /// security but tests any state transition the user should be able to make happen while using the system.
+/// `D`-prefixed `Bad` transitions are the exception: they inject messages an honest device would never
+/// send, which the coordinator must reject without panicking and without changing its state.
 struct HappyPathTest {
     run: Run,
     rng: TestRng,
@@ -858,6 +886,32 @@ impl StateMachineTest for HappyPathTest {
             Transition::CDeleteKey { key_index } => {
                 let as_ref = finished_keygens[key_index];
                 run.coordinator.delete_key(as_ref.key_id);
+            }
+            Transition::DBadSignatureShare {
+                device_index,
+                session_id,
+            } => {
+                let device_id = run.device_vec()[device_index];
+                let session_id = SignSessionId(session_id);
+                assert!(
+                    !sign_sessions.contains(&session_id),
+                    "the generated session id must not be one we actually issued"
+                );
+                // Deliberately not via the message queue: run_until would turn the
+                // expected rejection into a test failure.
+                let result = run.coordinator.recv_device_message(
+                    device_id,
+                    message::signing::DeviceSigning::SignatureShare {
+                        session_id,
+                        signature_shares: vec![],
+                        replenish_nonces: None,
+                    }
+                    .into(),
+                );
+                assert!(
+                    result.is_err(),
+                    "coordinator must reject shares for a session it never issued"
+                );
             }
         }
 
