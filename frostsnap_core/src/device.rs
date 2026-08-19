@@ -406,9 +406,12 @@ impl<S: NonceStreamSlot + core::fmt::Debug> FrostSigner<S> {
                     bip32_path,
                 };
 
-                let network = self
-                    .wallet_network(key_id)
-                    .expect("cannot verify address on key that doesn't support bitcoin");
+                let network = self.wallet_network(key_id).ok_or_else(|| {
+                    Error::signer_invalid_message(
+                        &message,
+                        format!("key {key_id} doesn't support bitcoin addresses"),
+                    )
+                })?;
 
                 let address =
                     bitcoin::Address::from_script(&spk.spk(), network).expect("has address form");

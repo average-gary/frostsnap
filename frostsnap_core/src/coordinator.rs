@@ -1275,6 +1275,13 @@ impl FrostCoordinator {
             .get_frost_key(key_id)
             .ok_or(ActionError::StateInconsistent("no such frost key".into()))?;
 
+        if frost_key.purpose.bitcoin_network().is_none() {
+            // the device will reject this message so don't bother sending it
+            return Err(ActionError::StateInconsistent(
+                "key doesn't support bitcoin addresses".into(),
+            ));
+        }
+
         let master_appkey = frost_key.complete_key.master_appkey;
 
         // verify on any device that knows about this key

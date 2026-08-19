@@ -1,6 +1,7 @@
 use common::TEST_ENCRYPTION_KEY;
 use frostsnap_core::bitcoin_transaction::{LocalSpk, TransactionTemplate};
 use frostsnap_core::device::KeyPurpose;
+use frostsnap_core::message::{screen_verify::ScreenVerify, CoordinatorToDeviceMessage};
 use frostsnap_core::tweak::BitcoinBip32Path;
 use frostsnap_core::EnterPhysicalId;
 use frostsnap_core::{MasterAppkey, WireSignTask};
@@ -13,7 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 mod common;
 mod env;
-use crate::common::Run;
+use crate::common::{Run, Send};
 use crate::env::TestEnv;
 
 #[test]
@@ -236,6 +237,57 @@ fn test_verify_address() {
     run.run_until_finished(&mut env, &mut test_rng).unwrap();
 
     assert_eq!(env.verification_requests.len(), 3);
+}
+
+#[test]
+fn verify_address_on_non_bitcoin_key_should_be_rejected_not_panic() {
+    let mut env = TestEnv::default();
+    let mut test_rng = ChaCha20Rng::from_seed([123u8; 32]);
+
+    let mut run =
+        Run::start_after_keygen_and_nonces(1, 1, &mut env, &mut test_rng, 1, KeyPurpose::Test);
+    let key_data = run.coordinator.iter_keys().next().unwrap().clone();
+
+    // the coordinator shouldn't ask in the first place
+    assert!(run.coordinator.verify_address(key_data.key_id, 0).is_err());
+
+    // ..and the device must reject it rather than panic if a coordinator asks anyway
+    run.extend([Send::CoordinatorToDevice {
+        destinations: run.device_set(),
+        message: CoordinatorToDeviceMessage::ScreenVerify(ScreenVerify::VerifyAddress {
+            master_appkey: key_data.complete_key.master_appkey,
+            derivation_index: 0,
+        }),
+    }]);
+    assert!(run.run_until_finished(&mut env, &mut test_rng).is_err());
+    assert!(env.verification_requests.is_empty());
+
+    // the device is still usable afterwards
+    let access_structure_ref = run
+        .coordinator
+        .iter_access_structures()
+        .next()
+        .unwrap()
+        .access_structure_ref();
+    let session_id = run
+        .coordinator
+        .start_sign(
+            access_structure_ref,
+            WireSignTask::Test {
+                message: "still alive".into(),
+            },
+            &run.device_set(),
+            &mut test_rng,
+        )
+        .unwrap();
+    for device in run.device_set() {
+        let sign_req = run
+            .coordinator
+            .request_device_sign(session_id, device, TEST_ENCRYPTION_KEY);
+        run.extend(sign_req);
+    }
+    run.run_until_finished(&mut env, &mut test_rng).unwrap();
+    assert!(env.signatures.contains_key(&session_id));
 }
 
 #[test]
