@@ -82,9 +82,9 @@ impl<I: Send, O: Send> ReqAndResponse<I, O> {
 /// [`LOOKAHEAD`]: super::wallet::LOOKAHEAD
 const SUBSCRIPTION_LOOKAHEAD: u32 = 50;
 
-pub const SUPPORTED_NETWORKS: [bitcoin::Network; 4] = {
+pub const SUPPORTED_NETWORKS: [bitcoin::Network; 5] = {
     use bitcoin::Network::*;
-    [Bitcoin, Signet, Testnet, Regtest]
+    [Bitcoin, Signet, Testnet, Testnet4, Regtest]
 };
 
 pub type SyncResponse = spk_client::SyncResponse<ConfirmationBlockTime>;
@@ -808,5 +808,37 @@ mod test {
             Some((keychain, 900)),
             "the window must never narrow"
         );
+    }
+
+    /// Both default-server lookups are `match`es with an `_ => panic!` arm, and `Settings::new`
+    /// calls them for every entry in [`SUPPORTED_NETWORKS`] at startup. So adding a network here
+    /// without an arm there is a launch-time panic, not a compile error. This pins the pairing.
+    #[test]
+    fn every_supported_network_has_usable_defaults() {
+        for network in SUPPORTED_NETWORKS {
+            // Mirrors what `Conn::new` accepts: "ssl://host:port", "tcp://host:port", or a bare
+            // "host:port" (treated as tcp).
+            for (which, url) in [
+                ("primary", default_electrum_server(network)),
+                ("backup", default_backup_electrum_server(network)),
+            ] {
+                let socket_addr = match url.split_once("://") {
+                    Some(("ssl" | "tcp", rest)) => rest,
+                    Some((scheme, _)) => {
+                        panic!("{network} {which} '{url}' has unsupported scheme '{scheme}'")
+                    }
+                    None => url,
+                };
+                let (host, port) = socket_addr
+                    .split_once(':')
+                    .unwrap_or_else(|| panic!("{network} {which} '{url}' has no port"));
+                assert!(!host.is_empty(), "{network} {which} '{url}' has no host");
+                port.parse::<u16>()
+                    .unwrap_or_else(|e| panic!("{network} {which} '{url}' bad port: {e}"));
+            }
+
+            // The per-network handler also needs a genesis hash to check the server against.
+            bitcoin::constants::genesis_block(network).block_hash();
+        }
     }
 }
