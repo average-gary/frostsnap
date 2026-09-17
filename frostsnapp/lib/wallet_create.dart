@@ -1405,6 +1405,12 @@ class _WalletCreatePageState extends State<WalletCreatePage> {
             ),
             SegmentedButton<String>(
               showSelectedIcon: false,
+              // Five networks divide the row into segments of maxWidth/5, and each segment then
+              // spends 24dp of that on the padding it inherits from TextButton (the M3
+              // segmented-button defaults set none). That left "Testnet3"/"Testnet4" clipped by
+              // the fade below 440dp, hiding the digit that tells them apart. Reclaiming the
+              // padding is invisible above 440dp, where the labels already fit and are centred.
+              style: SegmentedButton.styleFrom(padding: EdgeInsets.zero),
               segments: BitcoinNetwork.supportedNetworks()
                   .map(
                     (network) => ButtonSegment(
