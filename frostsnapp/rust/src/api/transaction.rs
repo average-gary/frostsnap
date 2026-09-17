@@ -71,6 +71,24 @@ pub struct ConfirmationEstimates {
     pub high: f32,
 }
 
+/// Pick each tier's feerate out of `estimate_fee`'s reply by target, not by position.
+///
+/// `ChainClient::estimate_fee` collects into a map keyed by target and drops any target the server
+/// had no answer for, so the reply can be short or empty: indexing it positionally panicked, and on
+/// a partial reply it would have silently handed a tier another target's feerate. Testnet4's servers
+/// answer none of the three — `estimatefee` returns `-1` or errors.
+///
+/// `None` unless all three are present. A complete reply maps exactly as the positional code did,
+/// so nothing changes on networks whose servers do estimate fees.
+fn tiers_by_target(estimates: &[(u64, u64)]) -> Option<(f32, f32, f32)> {
+    let by_target = |target: u64| {
+        estimates
+            .iter()
+            .find_map(|(t, feerate)| (*t == target).then_some(*feerate as f32))
+    };
+    Some((by_target(1)?, by_target(2)?, by_target(3)?))
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[frb(type_64bit_int)]
 pub enum AmountType {
@@ -197,7 +215,8 @@ impl BuildTxState {
 
     /// Refresh confirmation estimates.
     ///
-    /// Returns `None` if a previous referesh request has not completed yet.
+    /// Returns `None` if a previous referesh request has not completed yet, or if the server has
+    /// no usable estimate for every target.
     pub fn refresh_confirmation_estimates(&self) -> anyhow::Result<Option<ConfirmationEstimates>> {
         use std::sync::atomic::Ordering;
 
@@ -210,27 +229,34 @@ impl BuildTxState {
         }
         self._trigger_changed();
 
-        let estimates = self._refresh_confirmation_estimates()?;
+        // Single exit point: an `Err` here used to skip the store below and leave the flag set,
+        // wedging the picker's spinner for the life of the send screen.
+        let estimates = self._refresh_confirmation_estimates();
 
         self.is_refreshing.store(false, Ordering::Release);
         self._trigger_changed();
 
-        Ok(Some(estimates))
+        estimates
     }
 
-    fn _refresh_confirmation_estimates(&self) -> anyhow::Result<ConfirmationEstimates> {
+    fn _refresh_confirmation_estimates(&self) -> anyhow::Result<Option<ConfirmationEstimates>> {
         let estimates = self.super_wallet.estimate_fee(vec![3, 2, 1])?;
+        let Some((low, medium, high)) = tiers_by_target(&estimates) else {
+            // Nothing to show. The send flow already covers this: the feerate dialog is forced
+            // when `feerate()` is null and its Custom tier pre-fills a floor.
+            return Ok(None);
+        };
         let confirmation_estimates = ConfirmationEstimates {
             last_refresh: std::time::UNIX_EPOCH.elapsed()?.as_secs(),
-            low: estimates[0].1 as _,
-            medium: estimates[1].1 as _,
-            high: estimates[2].1 as _,
+            low,
+            medium,
+            high,
         };
         let mut inner = self.inner.write().unwrap();
         if inner.confirmation_estimates != Some(confirmation_estimates) {
             inner.confirmation_estimates = Some(confirmation_estimates);
         }
-        Ok(confirmation_estimates)
+        Ok(Some(confirmation_estimates))
     }
 
     #[frb(sync)]
@@ -592,4 +618,39 @@ pub enum TryFinishTxError {
     MissingFeerate,
     IncompleteRecipientValues,
     InsufficientBalance,
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    /// A complete reply must map exactly as the old positional code did. `estimate_fee` returns a
+    /// map keyed by target, so it iterates ascending (1, 2, 3) whatever order the targets were
+    /// requested in. Mainnet servers always answer all three, so this is the case where behaviour
+    /// must not change.
+    #[test]
+    fn a_complete_reply_maps_low_to_one_block_and_high_to_three() {
+        assert_eq!(
+            tiers_by_target(&[(1, 30), (2, 20), (3, 10)]),
+            Some((30.0, 20.0, 10.0)),
+            "low = 1 block, medium = 2, high = 3, per ConfirmationEstimates' fields"
+        );
+    }
+
+    /// What Testnet4's servers actually return, plus the partial replies that used to hand a tier
+    /// the wrong target's feerate.
+    #[test]
+    fn an_incomplete_reply_is_no_estimate_rather_than_a_panic_or_a_mix_up() {
+        assert_eq!(tiers_by_target(&[]), None, "testnet4: nothing answers");
+        assert_eq!(
+            tiers_by_target(&[(2, 20)]),
+            None,
+            "one target is not an estimate for three tiers"
+        );
+        assert_eq!(
+            tiers_by_target(&[(1, 30), (3, 10)]),
+            None,
+            "a hole in the middle is not an estimate"
+        );
+    }
 }
