@@ -82,9 +82,9 @@ impl<I: Send, O: Send> ReqAndResponse<I, O> {
 /// [`LOOKAHEAD`]: super::wallet::LOOKAHEAD
 const SUBSCRIPTION_LOOKAHEAD: u32 = 50;
 
-pub const SUPPORTED_NETWORKS: [bitcoin::Network; 4] = {
+pub const SUPPORTED_NETWORKS: [bitcoin::Network; 5] = {
     use bitcoin::Network::*;
-    [Bitcoin, Signet, Testnet, Regtest]
+    [Bitcoin, Signet, Testnet, Testnet4, Regtest]
 };
 
 pub type SyncResponse = spk_client::SyncResponse<ConfirmationBlockTime>;
