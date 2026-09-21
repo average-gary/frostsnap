@@ -197,7 +197,8 @@ impl BuildTxState {
 
     /// Refresh confirmation estimates.
     ///
-    /// Returns `None` if a previous referesh request has not completed yet.
+    /// Returns `None` if a previous referesh request has not completed yet, or if the server has
+    /// no usable estimate for every target.
     pub fn refresh_confirmation_estimates(&self) -> anyhow::Result<Option<ConfirmationEstimates>> {
         use std::sync::atomic::Ordering;
 
@@ -210,27 +211,44 @@ impl BuildTxState {
         }
         self._trigger_changed();
 
-        let estimates = self._refresh_confirmation_estimates()?;
+        // Single exit point: an `Err` here used to skip the store below and leave the flag set,
+        // wedging the picker's spinner for the life of the send screen.
+        let estimates = self._refresh_confirmation_estimates();
 
         self.is_refreshing.store(false, Ordering::Release);
         self._trigger_changed();
 
-        Ok(Some(estimates))
+        estimates
     }
 
-    fn _refresh_confirmation_estimates(&self) -> anyhow::Result<ConfirmationEstimates> {
+    fn _refresh_confirmation_estimates(&self) -> anyhow::Result<Option<ConfirmationEstimates>> {
         let estimates = self.super_wallet.estimate_fee(vec![3, 2, 1])?;
+        // Look each tier up by its target rather than by position. `estimate_fee` collects into a
+        // map keyed by target and drops any the server had no answer for, so the reply can be short
+        // or empty: indexing it panicked, and on a partial reply it would have silently handed a
+        // tier another target's feerate. Testnet4's servers answer none of the three.
+        let by_target = |target: u64| {
+            estimates
+                .iter()
+                .find_map(|(t, feerate)| (*t == target).then_some(*feerate as f32))
+        };
+        let (Some(low), Some(medium), Some(high)) = (by_target(1), by_target(2), by_target(3))
+        else {
+            // Nothing to show. The send flow already covers this: the feerate dialog is forced
+            // when `feerate()` is null and its Custom tier pre-fills a floor.
+            return Ok(None);
+        };
         let confirmation_estimates = ConfirmationEstimates {
             last_refresh: std::time::UNIX_EPOCH.elapsed()?.as_secs(),
-            low: estimates[0].1 as _,
-            medium: estimates[1].1 as _,
-            high: estimates[2].1 as _,
+            low,
+            medium,
+            high,
         };
         let mut inner = self.inner.write().unwrap();
         if inner.confirmation_estimates != Some(confirmation_estimates) {
             inner.confirmation_estimates = Some(confirmation_estimates);
         }
-        Ok(confirmation_estimates)
+        Ok(Some(confirmation_estimates))
     }
 
     #[frb(sync)]
