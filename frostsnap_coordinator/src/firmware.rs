@@ -16,13 +16,13 @@ impl FirmwareVersion {
         }
     }
 
-    pub fn features(&self) -> FirmwareFeatures {
-        match self.version {
-            Some(version) => version.features(),
-            None => FirmwareFeatures::all(),
-        }
-    }
-
+    /// REMOVED ON PURPOSE: `features()`.
+    ///
+    /// It used to answer [`FirmwareFeatures::all`] whenever `version` was `None`,
+    /// i.e. every feature for any digest it did not recognize — the modern path by
+    /// accident of an unknown digest rather than by anyone's decision. Features
+    /// now come from an identified profile: [`crate::DeviceProfile::features`].
+    /// There is no fail-open left to inherit.
     pub fn version_name(&self) -> String {
         match self.version {
             Some(version) => format!("v{}", version),
@@ -41,10 +41,30 @@ impl FirmwareVersion {
             return FirmwareUpgradeEligibility::UpToDate;
         }
 
+        // A registered cold-snap Mk4. `self` is an ESP32 image: it is the wrong
+        // hardware family, so there is no version comparison to make and nothing
+        // to offer. WITHOUT THIS the device lands in the `(None, None)` arm below
+        // — a dev app would report `CanUpgrade` for it and offer an ESP32 image to
+        // an Mk4. Being unable to update it does not make it incompatible; that
+        // question is `DeviceProfile::is_compatible`.
+        if let Some(revision) = crate::device_profile::registered_mk4_revision(device_digest) {
+            return FirmwareUpgradeEligibility::CannotUpgrade {
+                reason: format!(
+                    "This app has no update for cold-snap Mk4 firmware ({revision}). \
+                     Mk4 updates are installed on the device itself."
+                ),
+            };
+        }
+
         let device_version = VersionNumber::from_digest(device_digest);
         let app_version = self.version;
 
         match (device_version, app_version) {
+            // Dev app, dev device: the development affordance, kept. RESIDUAL, and
+            // it is inherent to identifying hardware by a self-reported digest: an
+            // Mk4 that is NOT in `coldsnap-mk4-registry.txt` is wire-identical to
+            // an ESP32 development build here, so it lands in this arm too.
+            // Registering it is the remedy, which is what the registry is for.
             (None, None) => FirmwareUpgradeEligibility::CanUpgrade,
             (None, Some(_)) => FirmwareUpgradeEligibility::CannotUpgrade {
                 reason:

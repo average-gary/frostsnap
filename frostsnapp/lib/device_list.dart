@@ -88,10 +88,19 @@ class _DeviceListPageState extends State<DeviceListPage> {
                 Icons.system_update_alt,
                 color: theme.colorScheme.primary,
               ),
-              cannotUpgrade: (reason) => Tooltip(
-                message: reason,
-                child: Icon(Icons.warning, color: theme.colorScheme.onSurface),
-              ),
+              // No warning for a device we can talk to and simply have no
+              // update for — a recognized cold-snap Mk4 always answers
+              // `CannotUpgrade`, and badging that as a problem is what made it
+              // read as incompatible everywhere.
+              cannotUpgrade: (reason) => device.isCompatible()
+                  ? SizedBox.shrink()
+                  : Tooltip(
+                      message: '${device.firmwareName()}: $reason',
+                      child: Icon(
+                        Icons.warning,
+                        color: theme.colorScheme.onSurface,
+                      ),
+                    ),
             ),
             Icon(Icons.chevron_right),
           ],

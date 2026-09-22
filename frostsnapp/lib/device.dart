@@ -9,6 +9,7 @@ import 'package:frostsnap/id_ext.dart';
 import 'package:frostsnap/src/rust/api.dart';
 import 'package:frostsnap/src/rust/api/coordinator.dart';
 import 'package:frostsnap/src/rust/api/device_list.dart';
+import 'package:frostsnap/src/rust/api/firmware.dart';
 import 'package:frostsnap/theme.dart';
 
 import 'global.dart';
@@ -120,6 +121,7 @@ class _DeviceDetailsState extends State<DeviceDetails> {
     final isEmpty = deviceName == null;
     final hasWallet = wallet != null;
     final upgradeEligibility = device.firmwareUpgradeEligibility();
+    final capabilities = device.capabilities();
     final noncesAvailable = coord.noncesAvailable(id: device.id);
 
     final emptyRows = [
@@ -189,16 +191,43 @@ class _DeviceDetailsState extends State<DeviceDetails> {
         ListTile(
           contentPadding: EdgeInsets.symmetric(horizontal: 16),
           title: Text('Erase device'),
-          subtitle: Text('Delete everything from this device'),
-          leading: Icon(Icons.delete_forever_rounded),
-          trailing: TextButton(
-            onPressed: () => showEraseDialog(context, device.id),
-            child: Text('Erase'),
-            style: TextButton.styleFrom(
-              foregroundColor: theme.colorScheme.error,
-            ),
+          // `coord.eraseDevice` refuses this itself — the button being absent is
+          // not the enforcement. A refused `DataErase` is answered by silence on
+          // the wire, so an ungated button would look like it had worked.
+          subtitle: Text(
+            capabilities.erase
+                ? 'Delete everything from this device'
+                : 'This device erases itself from its own menu, not from the app',
           ),
+          leading: Icon(Icons.delete_forever_rounded),
+          enabled: capabilities.erase,
+          trailing: capabilities.erase
+              ? TextButton(
+                  onPressed: () => showEraseDialog(context, device.id),
+                  child: Text('Erase'),
+                  style: TextButton.styleFrom(
+                    foregroundColor: theme.colorScheme.error,
+                  ),
+                )
+              : Text(
+                  'Unsupported',
+                  style: TextStyle(color: theme.disabledColor),
+                ),
         ),
+      // NEVER "passed": `FactoryAttestation` has no success variant in Rust or
+      // in Dart, and a self-reported firmware digest identifies compatibility,
+      // not authenticated hardware.
+      ListTile(
+        contentPadding: EdgeInsets.symmetric(horizontal: 16),
+        title: Text('Factory attestation'),
+        subtitle: Text(switch (capabilities.factoryAttestation) {
+          FactoryAttestation.unsupported =>
+            'Unsupported by this firmware — nothing to check',
+          FactoryAttestation.notChecked => 'Not checked by this app',
+        }),
+        leading: Icon(Icons.verified_user_outlined),
+        enabled: false,
+      ),
     ];
 
     final advancedRows = [
@@ -245,7 +274,10 @@ class _DeviceDetailsState extends State<DeviceDetails> {
                     vertical: 2,
                   ),
                   child: Text(
-                    device.firmware.versionName(),
+                    // Profile-aware: distinguishes an Mk4 from an ESP32
+                    // development build, which `FirmwareVersion.versionName()`
+                    // rendered as `dev-xxxxxx` for both.
+                    device.firmwareName(),
                     style: TextStyle(
                       fontSize: 12,
                       color: theme.colorScheme.onPrimaryContainer,
@@ -274,6 +306,9 @@ class _DeviceDetailsState extends State<DeviceDetails> {
                 child: Text('Latest'),
               ),
             ),
+            // "No update available" and "incompatible" are different answers.
+            // `CannotUpgrade` covers both, so which one this is comes from the
+            // device's profile, not from the eligibility enum.
             cannotUpgrade: (reason) => Tooltip(
               message: reason,
               child: Card.outlined(
@@ -285,9 +320,16 @@ class _DeviceDetailsState extends State<DeviceDetails> {
                   child: Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      Icon(Icons.warning_rounded, size: 16),
+                      Icon(
+                        device.isCompatible()
+                            ? Icons.info_outline_rounded
+                            : Icons.warning_rounded,
+                        size: 16,
+                      ),
                       SizedBox(width: 4),
-                      Text('Incompatible'),
+                      Text(
+                        device.isCompatible() ? 'No update' : 'Incompatible',
+                      ),
                     ],
                   ),
                 ),
@@ -460,6 +502,15 @@ class _DeviceDetailsState extends State<DeviceDetails> {
       if (mounted) {
         final route = ModalRoute.of(context);
         if (route?.isCurrent == true) Navigator.pop(context);
+      }
+    } catch (e) {
+      // `coord.eraseDevice` refuses firmware that answers `DataErase` with
+      // silence. The button is hidden for it, but the refusal lives in Rust, so
+      // a direct or racing call arrives here instead of as an unhandled error.
+      if (context.mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Cannot erase device: $e')));
       }
     } finally {
       if (_eraseController == controller) _eraseController = null;

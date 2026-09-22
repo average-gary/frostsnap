@@ -1,5 +1,6 @@
 pub mod backup_run;
 pub mod check_backup;
+pub mod device_profile;
 pub mod display_backup;
 pub mod enter_physical_backup;
 pub mod erase_device;
@@ -23,9 +24,10 @@ pub use frostsnap_comms;
 pub use frostsnap_core;
 pub use serial_port::*;
 pub mod settings;
+pub use device_profile::{DeviceCapabilities, DeviceProfile, FactoryAttestation};
 pub use firmware::{
-    FirmwareBin, FirmwareUpgradeEligibility, FirmwareValidationError, FirmwareVersion,
-    ValidatedFirmwareBin, VersionNumber,
+    FirmwareBin, FirmwareFeatures, FirmwareUpgradeEligibility, FirmwareValidationError,
+    FirmwareVersion, ValidatedFirmwareBin, VersionNumber,
 };
 pub use ui_protocol::*;
 pub use usb_serial_manager::*;

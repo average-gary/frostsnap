@@ -1,4 +1,4 @@
-use crate::{Completion, DeviceMode, FirmwareVersion, Sink, UiProtocol};
+use crate::{Completion, DeviceMode, Sink, UiProtocol};
 use frostsnap_comms::{CommsMisc, CoordinatorSendMessage};
 use frostsnap_core::schnorr_fun::frost::{ShareImage, ShareIndex};
 use frostsnap_core::{
@@ -40,10 +40,20 @@ impl CheckBackupProtocol {
         access_structure_ref: AccessStructureRef,
         share_index: ShareIndex,
         encryption_key: SymmetricKey,
-        firmware: FirmwareVersion,
+        // The identified profile, not a bare `FirmwareVersion`: the old
+        // `FirmwareVersion::features()` answered `all()` for any digest it did not
+        // recognize, so an unknown device took the modern path by accident rather
+        // than by a declared capability.
+        profile: crate::DeviceProfile,
         sink: impl Sink<CheckBackupState> + 'static,
     ) -> anyhow::Result<Self> {
-        let (messages, kind) = if firmware.features().check_backup {
+        // The legacy arm asks the human to retype all 25 words, so it is chosen
+        // only for firmware POSITIVELY IDENTIFIED as predating the quiz — see
+        // `DeviceProfile::needs_legacy_check_backup`. Asking
+        // `profile.features().check_backup` here read `Unrecognized` as "too old",
+        // which is every native ESP32 that is not byte-identical to the bundled
+        // image.
+        let (messages, kind) = if !profile.needs_legacy_check_backup() {
             let messages = coord
                 .request_device_check_backup(device_id, access_structure_ref, encryption_key)?
                 .into_iter()

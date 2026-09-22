@@ -276,8 +276,12 @@ impl Coordinator {
         self.0.delete_share(access_structure_ref, device_id)
     }
 
-    pub fn erase_device(&self, device_id: DeviceId, sink: StreamSink<EraseDeviceState>) {
-        self.0.erase_device(device_id, SinkWrap(sink));
+    pub fn erase_device(
+        &self,
+        device_id: DeviceId,
+        sink: StreamSink<EraseDeviceState>,
+    ) -> Result<()> {
+        self.0.erase_device(device_id, SinkWrap(sink))
     }
 
     pub fn erase_all_devices(&self) {

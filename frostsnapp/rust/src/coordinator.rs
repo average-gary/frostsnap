@@ -40,7 +40,7 @@ use frostsnap_core::{
     message, schnorr_fun::frost::ShareIndex, AccessStructureRef, DeviceId, KeyId, KeygenId,
     RestorationId, SignSessionId, SymmetricKey, WireSignTask,
 };
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::DerefMut;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
@@ -57,7 +57,10 @@ pub struct FfiCoordinator {
     ui_stack: Arc<Mutex<UiStack>>,
     pub(crate) usb_sender: UsbSender,
     firmware_bin: Option<ValidatedFirmwareBin>,
-    firmware_upgrade_progress: Arc<Mutex<Option<Box<dyn Sink<f32>>>>>,
+    /// The armed upgrade: which devices it is for, and where progress goes. The
+    /// device set travels with the sink because `run_firmware_upgrade` streams raw
+    /// bytes and needs to know which ports it may touch.
+    firmware_upgrade_progress: Arc<Mutex<Option<ArmedFirmwareUpgrade>>>,
     device_list: Arc<Mutex<DeviceList>>,
     device_list_stream: Arc<Mutex<Option<Box<dyn Sink<DeviceListUpdate>>>>>,
     // // persisted things
@@ -70,6 +73,9 @@ pub struct FfiCoordinator {
 }
 
 type Signal = Box<dyn Sink<()>>;
+
+/// The devices an armed firmware upgrade is for, and where its progress goes.
+type ArmedFirmwareUpgrade = (BTreeSet<DeviceId>, Box<dyn Sink<f32>>);
 
 impl FfiCoordinator {
     pub fn new(
@@ -142,11 +148,13 @@ impl FfiCoordinator {
 
                 // check for firmware upgrade mode before locking anything else
                 let mut firmware_upgrade_progress_loop = firmware_upgrade_progress.lock().unwrap();
-                if let Some(firmware_upgrade_pogress) = &mut *firmware_upgrade_progress_loop {
+                if let Some((upgrade_devices, firmware_upgrade_pogress)) =
+                    &mut *firmware_upgrade_progress_loop
+                {
                     // We're in a firmware upgrade.
                     // Do the firmware upgrade and then carry on as usual
                     let mut error = Ok(());
-                    match usb_manager.run_firmware_upgrade() {
+                    match usb_manager.run_firmware_upgrade(upgrade_devices) {
                         Ok(progress_iter) => {
                             for progress in progress_iter {
                                 match progress {
@@ -381,7 +389,17 @@ impl FfiCoordinator {
         sink: impl Sink<frostsnap_coordinator::keygen::KeyGenState>,
     ) -> anyhow::Result<()> {
         let device_list = self.device_list.lock().unwrap();
-        let devices = devices.into_iter().collect();
+        let devices: HashSet<DeviceId> = devices.into_iter().collect();
+
+        // REFUSED HERE, not only in the UI: this is reachable straight over the
+        // bridge, so a Dart-side filter cannot be the enforcement.
+        let selected: Vec<_> = device_list
+            .devices()
+            .into_iter()
+            .filter(|device| devices.contains(&device.id))
+            .collect();
+        api::device_list::check_keygen_group(&selected, devices.len())?;
+
         // sort them as connected so we get #1 assigned to the first one etc
         let devices = device_list.sort_as_connected(devices).collect();
         let currently_connected = device_list.devices().into_iter().map(|device| device.id);
@@ -550,6 +568,31 @@ impl FfiCoordinator {
         Ok(())
     }
 
+    /// The connected devices that may take the app's bundled ESP32 image.
+    ///
+    /// THE ONE PLACE THIS IS DECIDED, so the protocol's device set, the ports the
+    /// raw stream may touch and the progress denominator cannot disagree. A device
+    /// is in when the app holds an image it can install — up to date counts,
+    /// because an up-to-date device on a shared chain still has to forward bytes.
+    /// A cold-snap Mk4 is out: its firmware refuses every
+    /// `CoordinatorUpgradeMessage` and cannot report that refusal, so including it
+    /// would hang the upgrade waiting for an ack that cannot be sent.
+    fn esp32_upgrade_devices(&self) -> BTreeSet<DeviceId> {
+        self.device_list
+            .lock()
+            .unwrap()
+            .devices()
+            .into_iter()
+            .filter(|device| {
+                !matches!(
+                    device.firmware_upgrade_eligibility(),
+                    api::firmware::FirmwareUpgradeEligibility::CannotUpgrade { .. }
+                )
+            })
+            .map(|device| device.id)
+            .collect()
+    }
+
     pub fn begin_upgrade_firmware(
         &self,
         sink: impl Sink<FirmwareUpgradeConfirmState>,
@@ -557,15 +600,26 @@ impl FfiCoordinator {
         let firmware_bin = self.firmware_bin.ok_or(anyhow!(
             "App wasn't compiled with BUNDLE_FIRMWARE so it can't do firmware upgrades"
         ))?;
+        let upgrade_devices = self.esp32_upgrade_devices();
 
         let ui_protocol = {
             let device_list = self.device_list.lock().unwrap();
 
+            // Only the selected devices. This used to be every connected device,
+            // which put a cold-snap Mk4 in the set the protocol waits on and let
+            // one unrecognized device pick the legacy message for all of them.
             let devices: HashMap<DeviceId, FirmwareVersion> = device_list
                 .devices()
                 .into_iter()
+                .filter(|device| upgrade_devices.contains(&device.id))
                 .map(|device| (device.id, device.firmware))
                 .collect();
+
+            if devices.is_empty() {
+                return Err(anyhow!(
+                    "no connected device can take this app's firmware image"
+                ));
+            }
 
             let need_upgrade = device_list
                 .devices()
@@ -626,6 +680,15 @@ impl FfiCoordinator {
     }
 
     pub fn enter_firmware_upgrade_mode(&self, sink: impl Sink<f32>) -> Result<()> {
+        // Recomputed here rather than carried over from `begin_upgrade_firmware`:
+        // this is the call that arms the raw byte stream, and it is reachable
+        // directly over the bridge, so the refusal has to live on this side of it.
+        let upgrade_devices = self.esp32_upgrade_devices();
+        if upgrade_devices.is_empty() {
+            return Err(anyhow!(
+                "no connected device can take this app's firmware image"
+            ));
+        }
         match &mut *self.firmware_upgrade_progress.lock().unwrap() {
             Some(_) => {
                 event!(
@@ -636,7 +699,7 @@ impl FfiCoordinator {
                     "trierd to enter firmware upgrade mode while already in an upgrade"
                 ));
             }
-            progress => *progress = Some(Box::new(sink)),
+            progress => *progress = Some((upgrade_devices, Box::new(sink))),
         }
         Ok(())
     }
@@ -983,13 +1046,40 @@ impl FfiCoordinator {
         self.device_list.lock().unwrap().get_device(id)
     }
 
-    pub fn erase_device(&self, id: DeviceId, sink: impl Sink<EraseDeviceState>) {
+    pub fn erase_device(&self, id: DeviceId, sink: impl Sink<EraseDeviceState>) -> Result<()> {
+        // A cold-snap Mk4 answers `DataErase` with `Refusal::DataErase` and has no
+        // way to tell us, so the erase would sit there looking like it worked.
+        // Refused here so a direct bridge call cannot get past it either.
+        let device = self
+            .device_list
+            .lock()
+            .unwrap()
+            .get_device(id)
+            .ok_or_else(|| anyhow!("device not connected"))?;
+        if !device.capabilities().erase {
+            return Err(anyhow!(
+                "{} firmware does not support erasing device data from the app",
+                device.firmware_name()
+            ));
+        }
         let ui_protocol = EraseDevice::new(id, sink);
         self.start_protocol(ui_protocol);
+        Ok(())
     }
 
+    /// Erase every connected device whose firmware supports it. Devices that do
+    /// not are skipped rather than sent a message they will refuse in silence.
     pub fn erase_all_devices(&self) {
-        self.usb_sender.erase_all()
+        let erasable = self
+            .device_list
+            .lock()
+            .unwrap()
+            .devices()
+            .into_iter()
+            .filter(|device| device.capabilities().erase)
+            .map(|device| device.id)
+            .collect();
+        self.usb_sender.erase_devices(erasable)
     }
 
     pub fn cancel_sign_session(&self, ssid: SignSessionId) -> anyhow::Result<()> {
@@ -1111,14 +1201,14 @@ impl FfiCoordinator {
         encryption_key: SymmetricKey,
         sink: impl Sink<CheckBackupState>,
     ) -> Result<()> {
-        let firmware = self
+        let profile = self
             .device_list
             .lock()
             .unwrap()
             .devices()
             .into_iter()
             .find(|d| d.id == device_id)
-            .map(|d| d.firmware)
+            .map(|d| d.profile())
             .ok_or_else(|| anyhow!("device not connected"))?;
 
         let proto = CheckBackupProtocol::new(
@@ -1127,7 +1217,7 @@ impl FfiCoordinator {
             access_structure_ref,
             share_index,
             encryption_key,
-            firmware,
+            profile,
             sink,
         )?;
         self.start_protocol(proto);

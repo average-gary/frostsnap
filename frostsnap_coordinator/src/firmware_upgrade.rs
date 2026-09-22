@@ -22,6 +22,14 @@ pub struct FirmwareUpgradeProtocol {
 }
 
 impl FirmwareUpgradeProtocol {
+    /// `devices` MUST contain only devices that can take `firmware_bin` — see
+    /// `Coordinator::esp32_upgrade_devices`. Everything this protocol waits for is
+    /// keyed off that set: `is_complete` requires a passive `AckUpgradeMode` from
+    /// every device in it that is not an upgrade target, and `disconnected` aborts
+    /// for any device in it. A cold-snap Mk4 in here would block the upgrade
+    /// forever, because it does not merely decline to ack — its upgrade listener
+    /// has no `DeviceId` and its whole outbound vocabulary is the magic reply and
+    /// the next-chunk byte, so the ack cannot be sent even in principle.
     pub fn new(
         devices: HashMap<DeviceId, FirmwareVersion>,
         need_upgrade: BTreeSet<DeviceId>,
@@ -122,10 +130,18 @@ impl UiProtocol for FirmwareUpgradeProtocol {
     fn poll(&mut self) -> Vec<CoordinatorSendMessage> {
         let mut to_devices = vec![];
         if !self.sent_first_message && self.state.abort.is_none() {
-            let any_device_needs_legacy = self
-                .devices
-                .values()
-                .any(|fw| !fw.features().upgrade_digest_no_sig);
+            // The legacy message is OPT-IN BY POSITIVE IDENTIFICATION — see
+            // `DeviceProfile::needs_legacy_upgrade_message`. A device we cannot
+            // identify is not thereby old, and putting it on the legacy dialect
+            // announces the signed digest, which every modern device refuses.
+            // `self.devices` holds only devices the caller selected for this
+            // upgrade, so a connected Mk4 cannot swing this choice for its ESP32
+            // peers either.
+            let bundled = self.firmware_bin.digest();
+            let any_device_needs_legacy = self.devices.values().any(|fw| {
+                crate::DeviceProfile::identify(fw.digest, Some(bundled))
+                    .needs_legacy_upgrade_message()
+            });
 
             let upgrade_message = if any_device_needs_legacy {
                 CoordinatorUpgradeMessage::PrepareUpgrade {
@@ -139,8 +155,17 @@ impl UiProtocol for FirmwareUpgradeProtocol {
                 }
             };
 
+            // ADDRESSED, NOT BROADCAST. This used to be `Destination::All`, which
+            // reached every device on every ready port — including a cold-snap Mk4,
+            // whose only possible answer to any `CoordinatorUpgradeMessage` is
+            // `Refusal::FirmwareUpgrade`, and which cannot report that refusal on
+            // the wire. Naming the recipients keeps the message off devices that
+            // were not selected while still travelling the port they share, so a
+            // daisy-chained device forwards it exactly as before.
             to_devices.push(CoordinatorSendMessage {
-                target_destinations: frostsnap_comms::Destination::All,
+                target_destinations: frostsnap_comms::Destination::Particular(
+                    self.devices.keys().copied().collect(),
+                ),
                 message_body: CoordinatorSendBody::Upgrade(upgrade_message),
             });
             self.sent_first_message = true;

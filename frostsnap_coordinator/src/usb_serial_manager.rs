@@ -658,18 +658,81 @@ impl UsbSerialManager {
         self.firmware_bin
     }
 
+    /// Ports the coordinator may stream `firmware_bin` down, given the devices
+    /// selected for the upgrade.
+    ///
+    /// A CHAIN IS ALL-OR-NOTHING. The stream is raw bytes with no addressing, so
+    /// every device on a port sees them; a port is therefore only usable if every
+    /// device the coordinator knows about on it was selected. That is what keeps
+    /// ESP32 firmware bytes off a cold-snap Mk4 daisy-chained behind an ESP32,
+    /// while leaving a chain of selected ESP32s to forward exactly as before.
+    fn upgrade_ports(&self, devices: &BTreeSet<DeviceId>) -> BTreeSet<String> {
+        self.reverse_device_ports
+            .iter()
+            .filter(|(port, on_port)| {
+                self.ready.contains_key(*port)
+                    && !on_port.is_empty()
+                    && on_port.iter().all(|id| devices.contains(id))
+            })
+            .map(|(port, _)| port.clone())
+            .collect()
+    }
+
+    /// Stream the bundled firmware to `devices` and nothing else.
+    ///
+    /// This used to take no argument and write to EVERY ready port: one
+    /// `EnterUpgradeMode` broadcast per port, then the image, with no device or
+    /// port filter anywhere. A connected cold-snap Mk4 got the whole image.
     pub fn run_firmware_upgrade(
         &mut self,
+        devices: &BTreeSet<DeviceId>,
     ) -> anyhow::Result<impl Iterator<Item = anyhow::Result<f32>> + '_> {
         let firmware_bin = self.firmware_bin.ok_or(anyhow!(
             "App wasn't compiled with BUNDLE_FIRMWARE=1 so it can't do firmware upgrades"
         ))?;
+        // THE LAST GATE BEFORE THE RAW STREAM. Every path to these bytes goes
+        // through here, so the capability refusal lives here rather than only in
+        // the callers that build the device set. `Unrecognized` is deliberately not
+        // refused: a development app cannot tell an ESP32 development build from any
+        // other unknown digest, and refusing would break the native development
+        // upgrade — registering the Mk4 is what removes it from that case.
+        for id in devices {
+            let Some(digest) = self.firmware_digest_for_device(*id) else {
+                continue;
+            };
+            let profile = crate::DeviceProfile::identify(digest, Some(firmware_bin.digest()));
+            if profile.is_compatible() && !profile.capabilities().update_mode {
+                return Err(anyhow!(
+                    "{} does not accept a firmware upgrade from this app",
+                    profile.name(&digest)
+                ));
+            }
+        }
+
+        let ports = self.upgrade_ports(devices);
+        if ports.is_empty() {
+            return Err(anyhow!(
+                "no port carries only devices selected for this firmware upgrade, \
+                 so there is nowhere to send it"
+            ));
+        }
         let n_chunks = firmware_bin.size().div_ceil(FIRMWARE_UPGRADE_CHUNK_LEN);
-        let total_chunks = n_chunks * self.ready.len() as u32;
+        let total_chunks = n_chunks * ports.len() as u32;
 
         let mut iters = vec![];
 
-        for (port_index, (port, io)) in self.ready.iter_mut().enumerate() {
+        for (port_index, (port, io)) in self
+            .ready
+            .iter_mut()
+            .filter(|(port, _)| ports.contains(*port))
+            .enumerate()
+        {
+            // `All` is scoped by the port filter above, not by addressing: this is
+            // a raw send down one port, and `upgrade_ports` only returns a port
+            // whose every known device was selected. It stays `All` because the
+            // raw chunk stream that follows has no addressing either, so narrowing
+            // this one message would buy nothing and would change the bytes a
+            // native chain sees.
             let res = io.raw_send(ReceiveSerial::Message(CoordinatorSendMessage {
                 target_destinations: Destination::All,
                 message_body: CoordinatorSendBody::Upgrade(
@@ -794,10 +857,17 @@ impl UsbSender {
             .expect("receiver exists");
     }
 
-    pub fn erase_all(&self) {
+    /// Erase the data on `devices`, named rather than broadcast: `DataErase` used
+    /// to go to `Destination::All`, which reaches devices that refuse it (a
+    /// cold-snap Mk4 answers `Refusal::DataErase`) and devices the caller never
+    /// checked a capability for.
+    pub fn erase_devices(&self, devices: BTreeSet<DeviceId>) {
+        if devices.is_empty() {
+            return;
+        }
         self.sender
             .send(CoordinatorSendMessage {
-                target_destinations: Destination::All,
+                target_destinations: Destination::Particular(devices),
                 message_body: CoordinatorSendBody::DataErase,
             })
             .expect("receiver exists");

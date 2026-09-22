@@ -1191,13 +1191,25 @@ Future<void> _showEraseAllDialog(BuildContext context) async {
   final currentUpdate = await GlobalStreams.deviceListSubject.first;
   final devicesToErase = currentUpdate.state.devices
       // intentionally erasing all and not filtering out "blank"
+      //
+      // Firmware that refuses `DataErase` IS filtered out, and has to be: it is
+      // what `coord.eraseAllDevices()` addresses, and this list is also what
+      // seeds the dialog's action-needed set. A device the command never
+      // addressed would never confirm, so the dialog would wait on it forever.
+      .where((device) => device.capabilities().erase)
       .map((device) => device.id)
       .toList();
 
   if (devicesToErase.isEmpty) {
     if (context.mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Connect one or more devices to erase')),
+        SnackBar(
+          content: Text(
+            currentUpdate.state.devices.isEmpty
+                ? 'Connect one or more devices to erase'
+                : 'No connected device supports being erased from the app',
+          ),
+        ),
       );
     }
     return;

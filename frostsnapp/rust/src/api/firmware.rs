@@ -2,6 +2,9 @@ use super::coordinator::Coordinator;
 use crate::{frb_generated::StreamSink, sink_wrap::SinkWrap};
 use anyhow::Result;
 use flutter_rust_bridge::frb;
+pub use frostsnap_coordinator::device_profile::{
+    DeviceCapabilities, DeviceProfile, FactoryAttestation,
+};
 pub use frostsnap_coordinator::firmware::*;
 pub use frostsnap_coordinator::firmware_upgrade::FirmwareUpgradeConfirmState;
 pub use frostsnap_coordinator::frostsnap_comms::Sha256Digest;
@@ -80,6 +83,37 @@ impl FirmwareVersion {
         _device_digest: &Sha256Digest,
     ) -> FirmwareUpgradeEligibility {
     }
+}
+
+#[frb(mirror(DeviceProfile))]
+pub enum _DeviceProfile {
+    Esp32Frostsnap { release: Option<VersionNumber> },
+    ColdsnapMk4 { revision: String },
+    Unrecognized,
+}
+
+#[frb(mirror(DeviceCapabilities))]
+pub struct _DeviceCapabilities {
+    pub features: FirmwareFeatures,
+    pub backup: bool,
+    pub erase: bool,
+    pub update_mode: bool,
+    pub factory_attestation: FactoryAttestation,
+    pub max_keygen_devices: Option<u16>,
+}
+
+#[frb(mirror(FirmwareFeatures))]
+pub struct _FirmwareFeatures {
+    pub upgrade_digest_no_sig: bool,
+    pub check_backup: bool,
+}
+
+/// No `Passed` variant exists, in Rust or in Dart: nothing in this tree produces
+/// one, so rendering an attestation as passed is not expressible.
+#[frb(mirror(FactoryAttestation))]
+pub enum _FactoryAttestation {
+    Unsupported,
+    NotChecked,
 }
 
 #[frb(mirror(Sha256Digest))]

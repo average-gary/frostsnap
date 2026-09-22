@@ -122,6 +122,17 @@ class _DeviceDiscoveryWidgetState extends State<DeviceDiscoveryWidget> {
     super.dispose();
   }
 
+  // NO COMPATIBILITY GATE HERE, DELIBERATELY. One was added and removed again:
+  // `!isCompatible()` answers "is this the exact image I ship", and for native
+  // development hardware that is a different question from "can I talk to this
+  // device". `Unrecognized` is what every ESP32 not byte-identical to the bundled
+  // image identifies as — and every device at all when the app bundles none — so
+  // the gate refused exactly the population `RecoveryFlowStage.firmwareUpgrade()`
+  // exists to serve (`recovery_flow.dart`, the upgrade-then-continue path, which
+  // is reachable from nowhere else). It would also have been a UI-ONLY refusal:
+  // none of the entry points in `rust/src/api/recovery.rs` carries a capability
+  // check, so it could not have claimed a Rust refusal behind it.
+
   void _handleBlankDevice(deviceId) {
     final targetDevice = TargetDevice(deviceId);
     widget.onDeviceReady(targetDevice, null);

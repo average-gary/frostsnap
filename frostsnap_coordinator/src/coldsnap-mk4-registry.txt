@@ -1,0 +1,30 @@
+# Coordinator-side compatibility registry for cold-snap Mk4 firmware.
+#
+# COMPATIBILITY METADATA, NOT PERMISSION TO INSTALL. An entry here only lets this
+# app RECOGNIZE a device that announces the digest -- name it, decide what it can
+# do, and include it in wallet workflows. It is not an installation allowlist, a
+# release authority, a rollback ratchet or a trust anchor. A locally built Mk4
+# image signed with the published dev key 0 installs on a device whether or not it
+# appears here; the device's own bootloader decides that, and this file is not in
+# its reach.
+#
+# A DIGEST IS INTEGRITY, NEVER TRUST. The device reports this digest about itself
+# over the same wire as everything else, so a match identifies WHICH FIRMWARE, and
+# says nothing whatsoever about WHO sent it. Recognition is not attestation.
+#
+# WHICH DIGEST. A single sha256 over two ranges of the image, [0, 16320) then
+# [16384, firmware_length) -- the 64-byte key-0 signature inside the header
+# punched out. This is NOT `ValidatedFirmwareBin::digest()`'s contiguous ESP32
+# prefix and NOT the Mk4 bootloader's double hash; all three are different numbers
+# over the same bytes. See `tools/register-mk4-firmware.py` and
+# `cold-snap/golden/mk4-staging-vectors.txt`.
+#
+# REGISTRATION LIVES OUTSIDE THE IMAGE IT NAMES, by construction: an image cannot
+# contain its own digest, so entries are appended here after the artifact is built
+# and signed, with
+#
+#     frostsnap_coordinator/tools/register-mk4-firmware.py <image.bin> <label>
+#
+# Format: one revision per line -- `<announced digest, 64 lowercase hex> <label>`.
+
+58f1b3fe4cd2df9e38b93dda2a1224c8d7652ef89e0c10d38d5a46f04e39f441 mk4-2026-09-21

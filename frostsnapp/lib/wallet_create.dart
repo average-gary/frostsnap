@@ -80,6 +80,22 @@ Set<DeviceId> duplicateNamedDeviceIdsAmong(
   return dups;
 }
 
+/// The keygen party ceiling for a group: the smallest ceiling any participating
+/// firmware DECLARES (`DeviceCapabilities.maxKeygenDevices`), or `null` when none
+/// of them declares one.
+///
+/// The ceiling is a declared capability of the firmware taking part, never a
+/// number the app picked, and the refusal is enforced in Rust
+/// (`generate_new_key`, which consults `api::device_list::keygen_ceiling` before
+/// `BeginKeygen::new`). This exists only so the user is stopped at Continue
+/// instead of at an exception — it is not the enforcement.
+int? declaredKeygenCeiling(Iterable<int?> declared) =>
+    declared.whereType<int>().fold<int?>(
+      null,
+      (lowest, ceiling) =>
+          (lowest == null || ceiling < lowest) ? ceiling : lowest,
+    );
+
 class WalletCreateController extends ChangeNotifier {
   WalletCreateStep _step = WalletCreateStep.values.first;
   final WalletCreateForm _form = WalletCreateForm();
@@ -305,23 +321,37 @@ class WalletCreateController extends ChangeNotifier {
   int get connectedDeviceCount => _deviceList.devices.length;
   bool get devicesNeedUpgrade =>
       _deviceList.devices.any((dev) => dev.needsFirmwareUpgrade());
-  bool get devicesCanUpgrade => _deviceList.devices.any((dev) {
-    final eligibility = dev.firmwareUpgradeEligibility();
-    return eligibility.when(
-      upToDate: () => false,
-      canUpgrade: () => true,
-      cannotUpgrade: (_) => false,
-    );
-  });
   bool get devicesUsed => _deviceList.devices.any((dev) => dev.name != null);
-  bool get devicesIncompatible => _deviceList.devices.any((dev) {
-    final eligibility = dev.firmwareUpgradeEligibility();
-    return eligibility.when(
-      upToDate: () => false,
-      canUpgrade: () => false,
-      cannotUpgrade: (_) => true,
+
+  /// Firmware this app cannot talk to AND has no update for — i.e. exactly the
+  /// devices `buildDevicesBody` renders as "Incompatible firmware", which is what
+  /// both readers of this getter (`canGoNext` and the update banner) mean by it.
+  ///
+  /// Asked of the device's PROFILE, not of its upgrade eligibility:
+  /// `CannotUpgrade` also covers "this app holds no image for you", which a
+  /// recognized cold-snap Mk4 always answers, and reading that as incompatible is
+  /// what kept an Mk4 out of wallet creation.
+  ///
+  /// THE UPGRADE CLAUSE MATTERS AND IS NOT REDUNDANT. A native ESP32 flashed from
+  /// a different tree state than the app's bundle is `Unrecognized` *and*
+  /// upgradeable; the row already offers it "Tap to upgrade" ahead of the
+  /// incompatibility arm, and without this clause the banner at the foot of the
+  /// list — `devicesNeedUpgrade && !devicesIncompatible` — was suppressed for the
+  /// one device population it is for.
+  bool get devicesIncompatible => _deviceList.devices.any(
+    (dev) => !dev.isCompatible() && !dev.needsFirmwareUpgrade(),
+  );
+
+  /// The declared ceiling this group is over, or `null` when it is inside every
+  /// ceiling declared by the firmware taking part.
+  int? get exceededKeygenCeiling {
+    final ceiling = declaredKeygenCeiling(
+      _deviceList.devices.map((dev) => dev.capabilities().maxKeygenDevices),
     );
-  });
+    if (ceiling == null || _deviceList.devices.length <= ceiling) return null;
+    return ceiling;
+  }
+
   bool get allWalletDevicesConnected => _form.selectedDevices.every(
     (selectedId) =>
         _deviceList.devices.any((dev) => deviceIdEquals(dev.id, selectedId)),
@@ -347,6 +377,7 @@ class WalletCreateController extends ChangeNotifier {
           !devicesNeedUpgrade &&
           !devicesUsed &&
           !devicesIncompatible &&
+          exceededKeygenCeiling == null &&
           !hasDuplicateDeviceNames &&
           _deviceList.devices.every((d) => _form.deviceNames.containsKey(d.id)),
     WalletCreateStep.nonceReplenish => false, // Auto-advances, no manual next
@@ -633,6 +664,7 @@ class _WalletCreatePageState extends State<WalletCreatePage> {
   Widget buildDevicesBody(BuildContext context) {
     final theme = Theme.of(context);
     final parentCtx = context;
+    final ceilingExceeded = _controller.exceededKeygenCeiling;
     return MultiSliver(
       children: [
         SliverDeviceList(
@@ -659,23 +691,19 @@ class _WalletCreatePageState extends State<WalletCreatePage> {
               );
             }
 
-            return device.firmwareUpgradeEligibility().when(
-              upToDate: () => _deviceRow(
-                context: context,
-                title: _inlineNameField(context, device),
-                trailing: IconButton(
-                  icon: Icon(
-                    Icons.edit_rounded,
-                    color: cs.onSurfaceVariant,
-                    size: 20,
-                  ),
-                  tooltip: 'Edit device name',
-                  onPressed: () => _nameFocusNodes
-                      .putIfAbsent(device.id, () => FocusNode())
-                      .requestFocus(),
-                ),
-              ),
-              canUpgrade: () => _deviceRow(
+            // ORDER MATTERS, and it is not the eligibility enum's order.
+            //
+            // An update this app can actually perform is offered first, which
+            // keeps the development affordance for an unregistered dev build.
+            // Then incompatibility, asked of the PROFILE. Everything left is a
+            // device we can talk to and have no update for — including a
+            // recognized cold-snap Mk4 — and it gets the name field.
+            //
+            // Previously the name field lived on the `upToDate` arm alone, so a
+            // device the app had no image for was rendered "Incompatible
+            // firmware" with the row disabled and no way to name it.
+            if (device.needsFirmwareUpgrade()) {
+              return _deviceRow(
                 context: context,
                 title: const SizedBox.shrink(),
                 trailing: buildDeviceTrailingInfo(
@@ -686,24 +714,43 @@ class _WalletCreatePageState extends State<WalletCreatePage> {
                   color: Colors.orange,
                 ),
                 onTap: () async => await _upgradeController.run(parentCtx),
-              ),
-              cannotUpgrade: (reason) => _deviceRow(
+              );
+            }
+
+            if (!device.isCompatible()) {
+              return _deviceRow(
                 context: context,
                 title: const SizedBox.shrink(),
                 trailing: buildDeviceTrailingInfo(
                   context,
                   text: 'Incompatible firmware',
-                  subText: reason,
+                  subText: device.firmwareName(),
                   icon: Icons.warning_rounded,
                   color: cs.error,
                 ),
                 enabled: false,
+              );
+            }
+
+            return _deviceRow(
+              context: context,
+              title: _inlineNameField(context, device),
+              trailing: IconButton(
+                icon: Icon(
+                  Icons.edit_rounded,
+                  color: cs.onSurfaceVariant,
+                  size: 20,
+                ),
+                tooltip: 'Edit device name',
+                onPressed: () => _nameFocusNodes
+                    .putIfAbsent(device.id, () => FocusNode())
+                    .requestFocus(),
               ),
             );
           },
         ),
 
-        if (_controller.devicesCanUpgrade && !_controller.devicesIncompatible)
+        if (_controller.devicesNeedUpgrade && !_controller.devicesIncompatible)
           SliverToBoxAdapter(
             child: Card.outlined(
               margin: EdgeInsets.symmetric(vertical: 8),
@@ -741,6 +788,26 @@ class _WalletCreatePageState extends State<WalletCreatePage> {
                 contentPadding: EdgeInsets.symmetric(horizontal: 16),
                 title: Text(
                   'One or more devices have incompatible firmware. Unplug them to continue.',
+                ),
+                leading: Icon(
+                  Icons.warning_rounded,
+                  color: theme.colorScheme.error,
+                ),
+              ),
+            ),
+          ),
+        // The refusal itself is in Rust; this only says so before Continue.
+        if (ceilingExceeded != null)
+          SliverToBoxAdapter(
+            child: Card.outlined(
+              margin: EdgeInsets.symmetric(vertical: 8),
+              child: ListTile(
+                dense: true,
+                contentPadding: EdgeInsets.symmetric(horizontal: 16),
+                title: Text(
+                  'This device firmware supports at most $ceilingExceeded '
+                  'devices in one wallet. Unplug '
+                  '${_controller.connectedDeviceCount - ceilingExceeded} to continue.',
                 ),
                 leading: Icon(
                   Icons.warning_rounded,
