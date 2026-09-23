@@ -71,13 +71,7 @@ impl super::Api {
         use super::port::FfiSerial;
         let app_dir = PathBuf::from_str(&app_dir)?;
         let ffi_serial = FfiSerial::default();
-        let mut usb_manager = UsbSerialManager::new(Box::new(ffi_serial.clone()));
-        if let Some(firmware) = crate::FIRMWARE.map(ValidatedFirmwareBin::new).transpose()? {
-            usb_manager = usb_manager.with_firmware_bin(firmware);
-        }
-        if let Some(key) = load_genuine_cert_key() {
-            usb_manager = usb_manager.with_genuine_cert_key(key);
-        }
+        let usb_manager = usb_serial_manager(Box::new(ffi_serial.clone()))?;
         let (coord, app_state) = load_internal(app_dir, usb_manager)?;
         Ok((coord, app_state, ffi_serial))
     }
@@ -85,15 +79,57 @@ impl super::Api {
     // Desktop function using DesktopSerial
     pub fn load(&self, app_dir: String) -> anyhow::Result<(Coordinator, AppCtx)> {
         let app_dir = PathBuf::from_str(&app_dir)?;
-        let mut usb_manager = UsbSerialManager::new(Box::new(DesktopSerial));
-        if let Some(firmware) = crate::FIRMWARE.map(ValidatedFirmwareBin::new).transpose()? {
-            usb_manager = usb_manager.with_firmware_bin(firmware);
-        }
-        if let Some(key) = load_genuine_cert_key() {
-            usb_manager = usb_manager.with_genuine_cert_key(key);
-        }
-        load_internal(app_dir, usb_manager)
+        load_internal(app_dir, usb_serial_manager(Box::new(DesktopSerial))?)
     }
+
+    /// DEV/TEST ONLY: talk to the cold-snap app rig's pseudo-terminals instead of to
+    /// USB, and to nothing else.
+    ///
+    /// A SEPARATE ENTRY POINT and not a flag on [`Self::load`], so production
+    /// discovery is unchanged and unreachable from here, and so no environment
+    /// variable can flip a shipped app onto a test transport. `port_manifest` is the
+    /// `ports.txt` written by `cold-snap/tools/app-rig.py`; see
+    /// `crate::test_serial::PtySerial` for the polarity and baud-rate traps it
+    /// handles. Pass a disposable `app_dir`: both the sqlite DB and the bdk wallet
+    /// files derive from it.
+    pub fn load_test_pty_serial(
+        &self,
+        app_dir: String,
+        port_manifest: String,
+    ) -> anyhow::Result<(Coordinator, AppCtx)> {
+        let app_dir = PathBuf::from_str(&app_dir)?;
+        let manifest = PathBuf::from_str(&port_manifest)?;
+        // FAIL LOUD at startup rather than enumerating zero ports forever: a typo'd
+        // manifest path is indistinguishable from a rig that never came up.
+        if !manifest.is_file() {
+            anyhow::bail!(
+                "no app rig port manifest at {} -- start cold-snap/tools/app-rig.py first",
+                manifest.display()
+            );
+        }
+        event!(
+            Level::WARN,
+            manifest = manifest.display().to_string(),
+            "TEST TRANSPORT SELECTED: pty ports only, USB discovery is disabled"
+        );
+        let serial = crate::test_serial::PtySerial::new(manifest);
+        load_internal(app_dir, usb_serial_manager(Box::new(serial))?)
+    }
+}
+
+/// The manager configuration every entry point shares, so a test transport cannot
+/// quietly differ from production in the firmware bin or the genuine-cert key it was
+/// given. With `BUNDLE_FIRMWARE=0`, `crate::FIRMWARE` is `None` and no upgrade bin is
+/// attached -- which is a supported configuration, not a compatibility bypass.
+fn usb_serial_manager(serial: Box<dyn frostsnap_coordinator::Serial>) -> Result<UsbSerialManager> {
+    let mut usb_manager = UsbSerialManager::new(serial);
+    if let Some(firmware) = crate::FIRMWARE.map(ValidatedFirmwareBin::new).transpose()? {
+        usb_manager = usb_manager.with_firmware_bin(firmware);
+    }
+    if let Some(key) = load_genuine_cert_key() {
+        usb_manager = usb_manager.with_genuine_cert_key(key);
+    }
+    Ok(usb_manager)
 }
 
 #[cfg(genuine_cert_key)]

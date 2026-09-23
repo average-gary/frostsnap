@@ -314,6 +314,89 @@ impl SuperWallet {
             .gap_stranded_value(master_appkey, feerate)
     }
 
+    /// DEV/TEST ONLY: give this wallet a confirmed coin without a chain source, and return
+    /// the funding transaction's txid.
+    ///
+    /// For the cold-snap app rig, which has real devices and no chain: there is no Electrum
+    /// server on the test machine and `bitcoin-node` speaks JSON-RPC, not the Electrum
+    /// protocol, so the app has nothing to sync against. The coin arrives the way a finished
+    /// sync delivers one, through `CoordSuperWallet::apply_update`, and every step after it —
+    /// coin selection, `commit_send`, the change index, the signing session — is the app's own
+    /// code. See [`crate::test_chain::inject_funding`] for what `funding_tx_hex` picks between
+    /// (a deterministic fixture, or a real transaction from `tools/regtest.py fund` whose
+    /// spend `testmempoolaccept` can then judge).
+    ///
+    /// A SEPARATE, OBVIOUSLY-NAMED function rather than a flag on anything shipping: nothing
+    /// in the app calls it, and no setting turns it on.
+    #[frb(sync, type_64bit_int)]
+    pub fn test_inject_funding(
+        &self,
+        master_appkey: MasterAppkey,
+        value: u64,
+        funding_tx_hex: Option<String>,
+    ) -> Result<String> {
+        let txid = crate::test_chain::inject_funding(
+            &mut self.inner.lock().unwrap(),
+            master_appkey,
+            value,
+            funding_tx_hex,
+        )?;
+        Ok(txid.to_string())
+    }
+
+    /// Check `tx`'s Taproot key-path signatures against sighashes recomputed from `tx` itself
+    /// and the prevouts this wallet holds. Returns the number of inputs verified.
+    ///
+    /// INDEPENDENT OF THE SIGNER, which is the only reason it is worth running: the
+    /// coordinator's sighashes come from the `TransactionTemplate` and its signatures from
+    /// `schnorr_fun` FROST, while this starts from the finalised transaction's bytes and
+    /// checks with `secp256k1::verify_schnorr`. A signing session reporting success is not
+    /// evidence; this is. Errors name the input and the reason, and a prevout the wallet does
+    /// not hold is an error rather than a skipped input — a Taproot sighash commits to every
+    /// prevout, so it cannot be recomputed without all of them.
+    #[frb(sync)]
+    pub fn verify_taproot_signatures(&self, tx: &RTransaction) -> Result<u32> {
+        let wallet = self.inner.lock().unwrap();
+        let prevouts = tx
+            .input
+            .iter()
+            .map(|txin| {
+                wallet.get_txout(txin.previous_output).with_context(|| {
+                    format!(
+                        "this wallet does not hold prevout {}, so the taproot sighash \
+                         (which commits to every prevout) cannot be recomputed",
+                        txin.previous_output
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        drop(wallet);
+        crate::test_chain::verify_taproot_key_spends(tx, &prevouts)
+    }
+
+    /// DEV/TEST ONLY: [`Self::verify_taproot_signatures`] over a consensus-serialized hex
+    /// transaction. `RTransaction` is opaque to Dart, so this is the only way the app rig
+    /// can hand the in-house verifier a transaction it MUTATED after signing -- the
+    /// mutation Bitcoin Core must also refuse.
+    #[frb(sync)]
+    pub fn verify_taproot_signatures_hex(&self, tx_hex: String) -> Result<u32> {
+        let tx: RTransaction = bitcoin::consensus::encode::deserialize_hex(&tx_hex)?;
+        self.verify_taproot_signatures(&tx)
+    }
+
+    /// DEV/TEST ONLY: the consensus serialization of `tx` as hex.
+    ///
+    /// The one thing an out-of-process second opinion needs and the bridge does not
+    /// otherwise expose: `RTransaction` reaches Dart as an opaque with no accessors, so
+    /// without this the app rig cannot hand its own signed transaction to
+    /// `bitcoin-cli testmempoolaccept` (cold-snap `tools/regtest.py accept`). Reading
+    /// bytes out, never in — nothing is broadcast, and the caller is `regtest.py`'s
+    /// `testmempoolaccept`, which does not relay.
+    #[frb(sync)]
+    pub fn test_tx_hex(&self, tx: &RTransaction) -> String {
+        bitcoin::consensus::encode::serialize_hex(tx)
+    }
+
     pub fn psbt_to_unsigned_tx(
         &self,
         psbt: &Psbt,
