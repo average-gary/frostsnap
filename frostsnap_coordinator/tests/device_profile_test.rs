@@ -136,7 +136,16 @@ fn mk4_and_esp32_capabilities_differ() {
         factory_attestation,
         max_keygen_devices,
         features,
+        host_image_update,
     } = mk4;
+    assert!(
+        host_image_update,
+        "the Mk4 takes an image file through its own upgrade listener"
+    );
+    assert!(
+        !esp32.host_image_update,
+        "the ESP32 is upgraded through update_mode, never the Mk4 listener path"
+    );
     assert!(backup, "the Mk4 displays and accepts a physical backup");
     assert!(features.check_backup, "and answers the check-backup quiz");
     assert!(!erase, "DataErase is refused: Refusal::DataErase");

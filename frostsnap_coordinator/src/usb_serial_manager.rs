@@ -1,6 +1,6 @@
 // USB CDC vid and pid
-const USB_VID: u16 = 12346;
-const USB_PID: u16 = 4097;
+pub(crate) const USB_VID: u16 = 12346;
+pub(crate) const USB_PID: u16 = 4097;
 
 // The genuine check as currently implemented is vulnerable to a MITM:
 // a malicious device can forward a received challenge to a genuine
@@ -17,7 +17,7 @@ use frostsnap_comms::DeviceName;
 use frostsnap_comms::{CommsMisc, ReceiveSerial};
 use frostsnap_comms::{
     CoordinatorSendBody, CoordinatorUpgradeMessage, Destination, DeviceSendBody, Sha256Digest,
-    FIRMWARE_NEXT_CHUNK_READY_SIGNAL, FIRMWARE_UPGRADE_CHUNK_LEN,
+    FIRMWARE_UPGRADE_CHUNK_LEN,
 };
 use frostsnap_comms::{CoordinatorSendMessage, MAGIC_BYTES_PERIOD};
 use frostsnap_core::message::DeviceToCoordinatorMessage;
@@ -744,15 +744,10 @@ impl UsbSerialManager {
             // give some time for devices to forward things and enter upgrade mode
             std::thread::sleep(Duration::from_millis(100));
 
-            if let Err(e) = res {
-                event!(
-                    Level::ERROR,
-                    port = port,
-                    error = e.to_string(),
-                    "unable to send firmware upgrade initialiazation message"
-                );
-                continue;
-            }
+            // A selected port that could not be told to enter upgrade mode is a
+            // failed upgrade, not a port to skip: skipping it used to end the run
+            // "completed" with that device never streamed to.
+            res.map_err(|e| anyhow!("unable to send EnterUpgradeMode to {port}: {e}"))?;
 
             io.wait_for_conch()?;
 
@@ -764,45 +759,105 @@ impl UsbSerialManager {
 
             iters.push(core::iter::from_fn(move || {
                 let (i, chunk) = chunks.next()?;
-                if let Err(e) = io.raw_write(chunk) {
+                // One write, exactly one byte back, and it must be 0x11 — the
+                // shared rule. A wrong byte used to be logged at DEBUG and the
+                // transfer carried on.
+                if let Err(e) = crate::mk4_upgrade::send_chunk(io, i as u32, n_chunks, chunk) {
                     event!(
                         Level::ERROR,
                         port = port,
                         error = e.to_string(),
-                        "writing firmware failed"
+                        "firmware chunk failed"
                     );
-                    return Some(Err(e.into()));
-                }
-                let mut byte = [0u8; 1];
-
-                match io.raw_read(&mut byte[..]) {
-                    Ok(_) => {
-                        if byte[0] != FIRMWARE_NEXT_CHUNK_READY_SIGNAL {
-                            event!(
-                                Level::DEBUG,
-                                byte = byte[0].to_string(),
-                                "downstream device wrote invalid signal byte"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        event!(
-                            Level::ERROR,
-                            port = port,
-                            error = e.to_string(),
-                            "reading firmware progress signaling byte failed"
-                        );
-                        return Some(Err(e.into()));
-                    }
+                    return Some(Err(anyhow!("{port}: {e}")));
                 }
 
+                // Chunks DONE over chunks in total, so the last is exactly 1.0. It
+                // was `/ (total_chunks - 1)`, a 0/0 for a one-chunk image.
                 Some(Ok(
-                    ((port_index as u32 * n_chunks) + i as u32) as f32 / (total_chunks - 1) as f32
+                    ((port_index as u32 * n_chunks) + i as u32 + 1) as f32 / total_chunks as f32
                 ))
             }));
         }
 
-        Ok(iters.into_iter().flatten())
+        // The first failure ends the whole run: nothing after it is written, on
+        // this port or any later one.
+        // Checked BEFORE pulling, because pulling is what writes the next chunk.
+        let mut chunks = iters.into_iter().flatten();
+        let mut failed = false;
+        Ok(core::iter::from_fn(move || {
+            if failed {
+                return None;
+            }
+            let r = chunks.next()?;
+            failed = r.is_err();
+            Some(r)
+        }))
+    }
+
+    /// Ready ports on which no device has announced: where a cold-snap upgrade
+    /// listener shows up, since it answers the handshake and never announces.
+    /// Candidates only — the operator still names the one to use.
+    pub fn mk4_upgrade_ports(&self) -> Vec<String> {
+        let mut ports: Vec<String> = self
+            .ready
+            .keys()
+            .filter(|port| {
+                self.reverse_device_ports
+                    .get(*port)
+                    .is_none_or(|on_port| on_port.is_empty())
+            })
+            .cloned()
+            .collect();
+        ports.sort();
+        ports
+    }
+
+    /// Stage a checked Mk4 image into the upgrade listener on `port`, and touch no
+    /// other port.
+    ///
+    /// Identity-independent: the listener has no `DeviceId`, so `port` is the
+    /// whole selection. Refused, before a byte is written, if the port is not
+    /// ready or if any device on it has announced (see
+    /// [`crate::mk4_upgrade::Mk4UpgradeError::NotAnUpgradeListener`]). An ESP32
+    /// image cannot reach here: [`Mk4Firmware`] refuses it by type and by check.
+    ///
+    /// Afterwards the port is dropped and re-handshaken on the next poll whatever
+    /// the outcome: the peer is in raw mode or has left the listener, and the
+    /// framed state this object holds for it no longer describes it.
+    ///
+    /// [`Mk4Firmware`]: crate::mk4_firmware::Mk4Firmware
+    pub fn run_mk4_upgrade(
+        &mut self,
+        port: &str,
+        firmware: &crate::mk4_firmware::Mk4Firmware,
+        mut on_state: impl FnMut(crate::mk4_upgrade::Mk4UpgradeState),
+    ) -> Result<crate::mk4_upgrade::Mk4UpgradeState, crate::mk4_upgrade::Mk4UpgradeError> {
+        use crate::mk4_upgrade::Mk4UpgradeError;
+        let announced = self.reverse_device_ports.get(port).map_or(0, Vec::len);
+        if announced > 0 {
+            return Err(Mk4UpgradeError::NotAnUpgradeListener {
+                port: port.to_string(),
+                announced,
+            });
+        }
+        let io = self
+            .ready
+            .get_mut(port)
+            .ok_or_else(|| Mk4UpgradeError::PortNotReady {
+                port: port.to_string(),
+            })?;
+        event!(
+            Level::INFO,
+            port = port,
+            size = firmware.size(),
+            "staging Mk4 image"
+        );
+        let result = crate::mk4_upgrade::stage(io, firmware, &mut on_state);
+        let mut changes = vec![];
+        self.disconnect(port, &mut changes);
+        debug_assert!(changes.is_empty(), "no device was announced on {port}");
+        result
     }
 }
 

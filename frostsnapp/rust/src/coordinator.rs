@@ -17,6 +17,8 @@ use frostsnap_coordinator::frostsnap_comms::{
     CoordinatorSendBody, CoordinatorSendMessage, Destination, Sha256Digest,
 };
 use frostsnap_coordinator::frostsnap_persist::DeviceNames;
+use frostsnap_coordinator::mk4_firmware::Mk4Firmware;
+use frostsnap_coordinator::mk4_upgrade::Mk4UpgradeState;
 use frostsnap_coordinator::nonce_replenish::NonceReplenishState;
 use frostsnap_coordinator::persist::Persisted;
 use frostsnap_coordinator::signing::SigningState;
@@ -61,6 +63,12 @@ pub struct FfiCoordinator {
     /// device set travels with the sink because `run_firmware_upgrade` streams raw
     /// bytes and needs to know which ports it may touch.
     firmware_upgrade_progress: Arc<Mutex<Option<ArmedFirmwareUpgrade>>>,
+    /// An armed Mk4 staging run: the ONE port it may write, the checked image,
+    /// and where its states go. Keyed on a port because the Mk4 upgrade listener
+    /// has no `DeviceId`.
+    mk4_upgrade: Arc<Mutex<Option<ArmedMk4Upgrade>>>,
+    /// Ready ports with no announced device, as of the last poll.
+    mk4_upgrade_ports: Arc<Mutex<Vec<String>>>,
     device_list: Arc<Mutex<DeviceList>>,
     device_list_stream: Arc<Mutex<Option<Box<dyn Sink<DeviceListUpdate>>>>>,
     // // persisted things
@@ -76,6 +84,27 @@ type Signal = Box<dyn Sink<()>>;
 
 /// The devices an armed firmware upgrade is for, and where its progress goes.
 type ArmedFirmwareUpgrade = (BTreeSet<DeviceId>, Box<dyn Sink<f32>>);
+
+type ArmedMk4Upgrade = (String, Mk4Firmware, StreamSink<Mk4UpgradeState>);
+
+/// The refusals `start_mk4_upgrade` makes before arming anything: the image
+/// must pass every `Mk4Firmware` check (so an ESP32 image, a bad signature or a
+/// truncated file never reaches a port), and the port must be one the last poll
+/// listed.
+pub(crate) fn check_mk4_upgrade_request(
+    ports: &[String],
+    port: &str,
+    image_path: &str,
+) -> Result<Mk4Firmware> {
+    let firmware = Mk4Firmware::load(image_path)
+        .map_err(|e| anyhow!("{image_path} cannot be used for a Mk4: {e}"))?;
+    if !ports.iter().any(|p| p == port) {
+        return Err(anyhow!(
+            "{port} is not a ready port without a device in a normal session"
+        ));
+    }
+    Ok(firmware)
+}
 
 impl FfiCoordinator {
     pub fn new(
@@ -104,6 +133,8 @@ impl FfiCoordinator {
             signing_session_signals: Default::default(),
             ui_stack: Default::default(),
             firmware_upgrade_progress: Default::default(),
+            mk4_upgrade: Default::default(),
+            mk4_upgrade_ports: Default::default(),
             device_list: Default::default(),
             device_list_stream: Default::default(),
             usb_sender,
@@ -138,6 +169,8 @@ impl FfiCoordinator {
         let device_names = self.device_names.clone();
         let usb_sender = self.usb_sender.clone();
         let firmware_upgrade_progress = self.firmware_upgrade_progress.clone();
+        let mk4_upgrade = self.mk4_upgrade.clone();
+        let mk4_upgrade_ports = self.mk4_upgrade_ports.clone();
         let device_list = self.device_list.clone();
         let device_list_stream = self.device_list_stream.clone();
 
@@ -188,10 +221,34 @@ impl FfiCoordinator {
                     }
                 }
 
+                // Taken, not borrowed: the slot is free again whatever the outcome.
+                let armed_mk4 = mk4_upgrade.lock().unwrap().take();
+                if let Some((port, firmware, sink)) = armed_mk4 {
+                    let result = usb_manager.run_mk4_upgrade(&port, &firmware, |state| {
+                        let _ = sink.add(state);
+                    });
+                    match result {
+                        Ok(state) => {
+                            event!(Level::INFO, port, "mk4 image staged (not installed)");
+                            let _ = sink.add(state);
+                        }
+                        Err(e) => {
+                            event!(
+                                Level::ERROR,
+                                port,
+                                error = e.to_string(),
+                                "mk4 staging failed"
+                            );
+                            let _ = sink.add_error(anyhow!(e));
+                        }
+                    }
+                }
+
                 // NOTE: Never hold locks on anything over poll_ports because poll ports makes
                 // blocking calls up to flutter. If flutter is blocked on something else we'll
                 // be deadlocked.
                 let device_changes = usb_manager.poll_ports();
+                *mk4_upgrade_ports.lock().unwrap() = usb_manager.mk4_upgrade_ports();
                 let mut coordinator = coordinator_loop.lock().unwrap();
                 let mut coordinator_outbox = VecDeque::default();
                 let mut messages_from_devices = vec![];
@@ -702,6 +759,33 @@ impl FfiCoordinator {
             progress => *progress = Some((upgrade_devices, Box::new(sink))),
         }
         Ok(())
+    }
+
+    /// Ports that could carry a Mk4 upgrade listener, as of the last poll.
+    pub fn mk4_upgrade_ports(&self) -> Vec<String> {
+        self.mk4_upgrade_ports.lock().unwrap().clone()
+    }
+
+    /// Check `image_path` (every `Mk4Firmware` rule, before anything is armed),
+    /// then arm a staging run on `port` alone. States, and the named failure, go
+    /// to `sink`. The poll thread re-checks the port when it runs.
+    pub fn start_mk4_upgrade(
+        &self,
+        port: String,
+        image_path: String,
+        sink: StreamSink<Mk4UpgradeState>,
+    ) -> Result<()> {
+        let firmware = check_mk4_upgrade_request(&self.mk4_upgrade_ports(), &port, &image_path)?;
+        if self.firmware_upgrade_progress.lock().unwrap().is_some() {
+            return Err(anyhow!("a firmware upgrade is already running"));
+        }
+        match &mut *self.mk4_upgrade.lock().unwrap() {
+            Some((busy, ..)) => Err(anyhow!("an Mk4 upgrade is already armed on {busy}")),
+            slot => {
+                *slot = Some((port, firmware, sink));
+                Ok(())
+            }
+        }
     }
 
     pub fn get_device_name(&self, id: DeviceId) -> Option<String> {
@@ -1513,4 +1597,43 @@ fn key_state(coordinator: &FrostCoordinator) -> api::coordinator::KeyState {
     let restoring = coordinator.restoring().collect();
 
     api::coordinator::KeyState { keys, restoring }
+}
+
+#[cfg(test)]
+mod mk4_upgrade_request_tests {
+    use super::check_mk4_upgrade_request;
+
+    const ESP32_IMAGE: &[u8] =
+        include_bytes!("../../../frostsnap_coordinator/tests/v0.0.1-firmware-signed.bin");
+
+    #[test]
+    fn an_esp32_image_or_a_missing_file_is_refused_before_any_port() {
+        let dir = std::env::temp_dir().join(format!("mk4-request-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let esp32 = dir.join("esp32.bin");
+        std::fs::write(&esp32, ESP32_IMAGE).unwrap();
+        let ports = vec!["/dev/ttys999".to_string()];
+        for path in [esp32, dir.join("missing.bin")] {
+            let err = check_mk4_upgrade_request(&ports, "/dev/ttys999", path.to_str().unwrap())
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("cannot be used for a Mk4"), "{err}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Needs COLDSNAP_REPO for a real Mk4 artifact; FAILS without it.
+    #[test]
+    #[ignore = "needs COLDSNAP_REPO and the task-01 package"]
+    fn a_real_mk4_image_is_accepted_only_for_a_listed_port() {
+        let repo = std::env::var("COLDSNAP_REPO").expect("set COLDSNAP_REPO");
+        let image = format!("{repo}/target/software-only/package/coldsnap-6.0.0cs.dfu");
+        let ports = vec!["/dev/ttys999".to_string()];
+        let fw = check_mk4_upgrade_request(&ports, "/dev/ttys999", &image).unwrap();
+        assert_eq!(fw.version(), "6.0.0cs");
+        let err = check_mk4_upgrade_request(&ports, "/dev/ttys998", &image)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a ready port"), "{err}");
+    }
 }

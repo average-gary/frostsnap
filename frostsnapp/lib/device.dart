@@ -6,6 +6,7 @@ import 'package:frostsnap/contexts.dart';
 import 'package:frostsnap/copy_feedback.dart';
 import 'package:frostsnap/device_action_fullscreen_dialog.dart';
 import 'package:frostsnap/id_ext.dart';
+import 'package:frostsnap/mk4_upgrade.dart';
 import 'package:frostsnap/src/rust/api.dart';
 import 'package:frostsnap/src/rust/api/coordinator.dart';
 import 'package:frostsnap/src/rust/api/device_list.dart';
@@ -213,6 +214,16 @@ class _DeviceDetailsState extends State<DeviceDetails> {
                   'Unsupported',
                   style: TextStyle(color: theme.disabledColor),
                 ),
+        ),
+      // Gated on the declared capability; `start_mk4_upgrade` re-checks the
+      // image and the port in Rust, so the tile is not the enforcement.
+      if (capabilities.hostImageUpdate)
+        ListTile(
+          contentPadding: EdgeInsets.symmetric(horizontal: 16),
+          title: Text('Stage firmware image'),
+          subtitle: Text('Send a checked image file to the upgrade listener'),
+          leading: Icon(Icons.system_update_alt_rounded),
+          onTap: () => showMk4UpgradeDialog(context),
         ),
       // NEVER "passed": `FactoryAttestation` has no success variant in Rust or
       // in Dart, and a self-reported firmware digest identifies compatibility,

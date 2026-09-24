@@ -7,6 +7,8 @@ pub mod erase_device;
 pub mod firmware;
 pub mod firmware_upgrade;
 pub mod keygen;
+pub mod mk4_firmware;
+pub mod mk4_upgrade;
 pub mod nonce_replenish;
 mod serial_port;
 pub mod signing;

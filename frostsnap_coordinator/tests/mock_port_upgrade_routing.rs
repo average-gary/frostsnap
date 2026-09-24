@@ -20,6 +20,7 @@ use frostsnap_coordinator::{
 use frostsnap_core::DeviceId;
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 // From `usb_serial_manager.rs` — a port is ignored unless it matches.
@@ -29,17 +30,34 @@ const USB_PID: u16 = 4097;
 /// One direction of one port.
 type Pipe = Arc<Mutex<Vec<u8>>>;
 
+/// What a scripted peer does with one coordinator write.
+enum Reply {
+    Bytes(Vec<u8>),
+    /// The peer is gone: every read after this is end-of-stream.
+    HangUp,
+}
+
+/// A peer that answers each coordinator WRITE as it happens. Pre-seeded replies
+/// cannot model the Mk4 updater: it discards stale input at the framed-to-raw
+/// switch, which is exactly what it should do to a pre-seeded ack.
+type Responder = Arc<Mutex<dyn FnMut(&[u8]) -> Reply + Send>>;
+
 /// A port end: reads from `rx`, writes to `tx`.
 struct FakePortEnd {
     name: String,
     rx: Pipe,
     tx: Pipe,
+    responder: Option<Responder>,
+    hung_up: Arc<AtomicBool>,
 }
 
 impl Read for FakePortEnd {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let mut rx = self.rx.lock().unwrap();
         let n = buf.len().min(rx.len());
+        if n == 0 && self.hung_up.load(Ordering::SeqCst) {
+            return Ok(0);
+        }
         if n == 0 {
             // Never block: a test that would have waited forever fails instead.
             return Err(std::io::Error::new(
@@ -56,6 +74,12 @@ impl Read for FakePortEnd {
 impl Write for FakePortEnd {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.tx.lock().unwrap().extend_from_slice(buf);
+        if let Some(responder) = &self.responder {
+            match (responder.lock().unwrap())(buf) {
+                Reply::Bytes(bytes) => self.rx.lock().unwrap().extend(bytes),
+                Reply::HangUp => self.hung_up.store(true, Ordering::SeqCst),
+            }
+        }
         Ok(buf.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
@@ -135,6 +159,8 @@ impl serialport::SerialPort for FakePortEnd {
             name: self.name.clone(),
             rx: self.rx.clone(),
             tx: self.tx.clone(),
+            responder: self.responder.clone(),
+            hung_up: self.hung_up.clone(),
         }))
     }
     fn set_break(&self) -> serialport::Result<()> {
@@ -153,25 +179,47 @@ struct MockPort {
     to_coordinator: Pipe,
 }
 
+/// The coordinator's end of one registered port.
+struct PortSlot {
+    name: String,
+    rx: Pipe,
+    tx: Pipe,
+    responder: Option<Responder>,
+    hung_up: Arc<AtomicBool>,
+}
+
 #[derive(Default, Clone)]
 struct FakeSerial {
-    ports: Arc<Mutex<Vec<(String, Pipe, Pipe)>>>,
+    ports: Arc<Mutex<Vec<PortSlot>>>,
 }
 
 impl FakeSerial {
     /// Register a port and hand back the device end of it.
     fn add_port(&self, name: &str) -> (MockPort, FramedSerialPort<Upstream>) {
+        self.add_port_with(name, None)
+    }
+
+    /// As [`FakeSerial::add_port`], with a peer that answers every coordinator write.
+    fn add_port_with(
+        &self,
+        name: &str,
+        responder: Option<Responder>,
+    ) -> (MockPort, FramedSerialPort<Upstream>) {
         let from_coordinator: Pipe = Default::default();
         let to_coordinator: Pipe = Default::default();
-        self.ports.lock().unwrap().push((
-            name.to_string(),
-            to_coordinator.clone(),
-            from_coordinator.clone(),
-        ));
+        self.ports.lock().unwrap().push(PortSlot {
+            name: name.to_string(),
+            rx: to_coordinator.clone(),
+            tx: from_coordinator.clone(),
+            responder,
+            hung_up: Default::default(),
+        });
         let device_end = FakePortEnd {
             name: format!("{name}:device"),
             rx: from_coordinator.clone(),
             tx: to_coordinator.clone(),
+            responder: None,
+            hung_up: Default::default(),
         };
         (
             MockPort {
@@ -189,8 +237,8 @@ impl Serial for FakeSerial {
             .lock()
             .unwrap()
             .iter()
-            .map(|(name, _, _)| PortDesc {
-                id: name.clone(),
+            .map(|slot| PortDesc {
+                id: slot.name.clone(),
                 vid: USB_VID,
                 pid: USB_PID,
             })
@@ -203,14 +251,16 @@ impl Serial for FakeSerial {
         _baud_rate: u32,
     ) -> Result<Box<dyn serialport::SerialPort>, PortOpenError> {
         let ports = self.ports.lock().unwrap();
-        let (name, rx, tx) = ports
+        let slot = ports
             .iter()
-            .find(|(name, _, _)| name == unique_id)
+            .find(|slot| slot.name == unique_id)
             .expect("port exists");
         Ok(Box::new(FakePortEnd {
-            name: name.clone(),
-            rx: rx.clone(),
-            tx: tx.clone(),
+            name: slot.name.clone(),
+            rx: slot.rx.clone(),
+            tx: slot.tx.clone(),
+            responder: slot.responder.clone(),
+            hung_up: slot.hung_up.clone(),
         }))
     }
 }
@@ -508,4 +558,476 @@ fn the_mock_ports_really_carry_the_wire_protocol() {
     ));
     // Silence the unused-import warning for the direction the coordinator reads.
     let _: Option<ReceiveSerial<Downstream>> = None;
+}
+
+// ------------------------------------------------------------ the shared chunk rule
+
+/// The native runner used to log a wrong ready byte at DEBUG and carry on. Now
+/// it is a named failure, and nothing after it is written.
+#[test]
+fn a_wrong_ack_ends_a_native_upgrade() {
+    let mut f = fixture();
+    f.esp32_port
+        .to_coordinator
+        .lock()
+        .unwrap()
+        .extend([0x11, 0x5a, 0x11, 0x11, 0x11]);
+
+    let progress: Vec<_> = f
+        .manager
+        .run_firmware_upgrade(&BTreeSet::from([ESP32]))
+        .expect("the ESP32 is selected")
+        .collect();
+
+    assert_eq!(
+        progress.len(),
+        2,
+        "one good chunk, then the failure, then nothing"
+    );
+    assert!(progress[0].is_ok());
+    let err = progress[1]
+        .as_ref()
+        .expect_err("0x5a is not the ready signal");
+    assert!(err.to_string().contains("0x5a"), "{err}");
+    let w = written(&f.esp32_port);
+    assert!(
+        (2 * 4096..3 * 4096).contains(&w),
+        "exactly two chunks (plus one small frame) should have been written, got {w} bytes"
+    );
+}
+
+/// A missing ack is a named failure too, not a hang and not a success.
+#[test]
+fn a_missing_ack_ends_a_native_upgrade() {
+    let mut f = fixture();
+    f.esp32_port
+        .to_coordinator
+        .lock()
+        .unwrap()
+        .extend([0x11; 3]);
+
+    let progress: Vec<_> = f
+        .manager
+        .run_firmware_upgrade(&BTreeSet::from([ESP32]))
+        .expect("the ESP32 is selected")
+        .collect();
+
+    assert_eq!(progress.len(), 4);
+    assert!(progress[..3].iter().all(Result::is_ok));
+    let err = progress[3].as_ref().expect_err("no fourth ack was seeded");
+    assert!(
+        err.to_string().contains("no acknowledgement for chunk 3"),
+        "{err}"
+    );
+    assert!((4 * 4096..5 * 4096).contains(&written(&f.esp32_port)));
+}
+
+// ------------------------------------------------------------- the Mk4 updater
+
+#[path = "support/mk4_key0.rs"]
+mod mk4_key0;
+
+use frostsnap_comms::{CoordinatorSendBody, CoordinatorUpgradeMessage};
+use frostsnap_coordinator::mk4_firmware::Mk4Firmware;
+use frostsnap_coordinator::mk4_upgrade::{ChunkError, Mk4UpgradeError, Mk4UpgradeState};
+
+fn mk4_image() -> Mk4Firmware {
+    Mk4Firmware::from_artifact(&mk4_key0::ok_image()).expect("a key-0 image")
+}
+
+/// A scripted cold-snap upgrade listener: silent until `armed`, then the first
+/// write is the admission frames and write `k + 1` is chunk `k`, answered by
+/// `script(k)`. Records the length of every chunk write.
+struct Listener {
+    armed: Arc<AtomicBool>,
+    chunk_writes: Arc<Mutex<Vec<usize>>>,
+}
+
+fn listener(
+    serial: &FakeSerial,
+    name: &str,
+    script: impl Fn(u32) -> Reply + Send + 'static,
+) -> (MockPort, Listener) {
+    let armed = Arc::new(AtomicBool::new(false));
+    let chunk_writes: Arc<Mutex<Vec<usize>>> = Default::default();
+    let (a, c) = (armed.clone(), chunk_writes.clone());
+    let mut admitted = false;
+    let responder: Responder = Arc::new(Mutex::new(move |bytes: &[u8]| {
+        if !a.load(Ordering::SeqCst) {
+            return Reply::Bytes(vec![]);
+        }
+        if !admitted {
+            admitted = true;
+            return Reply::Bytes(vec![]);
+        }
+        let mut writes = c.lock().unwrap();
+        writes.push(bytes.len());
+        script(writes.len() as u32 - 1)
+    }));
+    let (port, mut end) = serial.add_port_with(name, Some(responder));
+    // The listener answers the handshake and never announces. (Once: a second
+    // decoded magic frame on a ready port is "Unexpected magic bytes" and the
+    // manager drops the port. The raw residue case is injected by `mk4_fixture`.)
+    end.write_magic_bytes().expect("magic");
+    (
+        port,
+        Listener {
+            armed,
+            chunk_writes,
+        },
+    )
+}
+
+fn ack(_: u32) -> Reply {
+    Reply::Bytes(vec![0x11])
+}
+
+struct Mk4Fixture {
+    manager: UsbSerialManager,
+    ports: Vec<(&'static str, MockPort)>,
+    listener_a: Listener,
+}
+
+/// An ESP32, an Mk4 in its normal session (announced), and two upgrade
+/// listeners (`listener-a` scripted by `script`, `listener-b` all-acks).
+fn mk4_fixture(script: impl Fn(u32) -> Reply + Send + 'static) -> Mk4Fixture {
+    let serial = FakeSerial::default();
+    let (esp32, mut esp32_end) = serial.add_port("port-esp32");
+    let (session, mut session_end) = serial.add_port("port-mk4-session");
+    let (a, listener_a) = listener(&serial, "listener-a", script);
+    let (b, listener_b) = listener(&serial, "listener-b", ack);
+    announce(&mut esp32_end, ESP32, bundle().digest());
+    announce(&mut session_end, MK4, mk4_digest());
+
+    let mut manager = UsbSerialManager::new(Box::new(serial)).with_firmware_bin(bundle());
+    for _ in 0..4 {
+        manager.poll_ports();
+    }
+    assert_eq!(manager.mk4_upgrade_ports(), ["listener-a", "listener-b"]);
+    let ports = vec![
+        ("port-esp32", esp32),
+        ("port-mk4-session", session),
+        ("listener-a", a),
+        ("listener-b", b),
+    ];
+    for (_, port) in &ports {
+        port.from_coordinator.lock().unwrap().clear();
+    }
+    // Handshake residue left where a careless raw read would find it: the first
+    // byte of a `MAGIC_REPLY`.
+    ports[2].1.to_coordinator.lock().unwrap().push(0x00);
+    listener_a.armed.store(true, Ordering::SeqCst);
+    listener_b.armed.store(true, Ordering::SeqCst);
+    Mk4Fixture {
+        manager,
+        ports,
+        listener_a,
+    }
+}
+
+impl Mk4Fixture {
+    fn run(
+        &mut self,
+        port: &str,
+    ) -> (
+        Result<Mk4UpgradeState, Mk4UpgradeError>,
+        Vec<Mk4UpgradeState>,
+    ) {
+        let mut states = vec![];
+        let r = self
+            .manager
+            .run_mk4_upgrade(port, &mk4_image(), |s| states.push(s));
+        (r, states)
+    }
+
+    /// Every port except `selected` received nothing at all — no frame, no chunk.
+    fn assert_untouched_except(&self, selected: Option<&str>) {
+        for (name, port) in &self.ports {
+            if Some(*name) != selected {
+                assert_eq!(
+                    written(port),
+                    0,
+                    "{name} was not selected but received bytes"
+                );
+            }
+        }
+    }
+
+    fn chunk_writes(&self) -> Vec<usize> {
+        self.listener_a.chunk_writes.lock().unwrap().clone()
+    }
+}
+
+/// CRITERION: the image stages on the ONE named port, the admission is exactly
+/// `PrepareUpgrade2 { size, two-range digest }` + `EnterUpgradeMode`, every
+/// chunk is a complete write, and every other port — the ESP32, the Mk4 in
+/// session and the second listener — gets zero bytes at either layer.
+#[test]
+fn an_mk4_image_stages_on_the_selected_listener_and_nowhere_else() {
+    let fw = mk4_image();
+    let mut f = mk4_fixture(ack);
+    let (result, states) = f.run("listener-a");
+
+    let staged = result.expect("every chunk acked");
+    assert_eq!(
+        staged,
+        Mk4UpgradeState::Staged {
+            size: fw.size(),
+            digest: fw.digest()
+        }
+    );
+    assert!(
+        !staged.is_installed(),
+        "a staging-only peer never yields installed"
+    );
+    assert_eq!(states.len(), fw.num_chunks() as usize);
+    assert_eq!(
+        states.last(),
+        Some(&Mk4UpgradeState::Transferring {
+            chunks_acked: fw.num_chunks(),
+            total_chunks: fw.num_chunks()
+        })
+    );
+    assert_eq!(f.chunk_writes(), vec![4096; fw.num_chunks() as usize]);
+    f.assert_untouched_except(Some("listener-a"));
+
+    // What went down the selected port, decoded with the shipped encoding.
+    let wire = f.ports[2].1.from_coordinator.lock().unwrap().clone();
+    let mut cursor = std::io::Cursor::new(&wire[..]);
+    let mut next_upgrade = || -> CoordinatorUpgradeMessage {
+        let frame: ReceiveSerial<Upstream> =
+            bincode::decode_from_std_read(&mut cursor, frostsnap_comms::BINCODE_CONFIG)
+                .expect("an admission frame");
+        let ReceiveSerial::Message(m) = frame else {
+            panic!("expected a message frame")
+        };
+        match m.message_body.decode() {
+            Some(CoordinatorSendBody::Upgrade(u)) => u,
+            other => panic!("expected an upgrade message, got {other:?}"),
+        }
+    };
+    assert!(matches!(
+        next_upgrade(),
+        CoordinatorUpgradeMessage::PrepareUpgrade2 { size, firmware_digest }
+            if size == fw.size() && firmware_digest == fw.digest()
+    ));
+    assert!(matches!(
+        next_upgrade(),
+        CoordinatorUpgradeMessage::EnterUpgradeMode
+    ));
+    let at = cursor.position() as usize;
+    assert_eq!(
+        &wire[at..],
+        fw.as_bytes(),
+        "after admission: the image, exactly"
+    );
+
+    // The port is dropped after the transfer: it has to re-handshake before it
+    // can be selected again, and nothing more is written to it meanwhile.
+    assert!(!f
+        .manager
+        .mk4_upgrade_ports()
+        .contains(&"listener-a".to_string()));
+    let (again, _) = f.run("listener-a");
+    assert!(matches!(again, Err(Mk4UpgradeError::PortNotReady { .. })));
+    assert_eq!(
+        f.ports[2].1.from_coordinator.lock().unwrap().len(),
+        wire.len()
+    );
+}
+
+/// Exactly one expected `0x11` per chunk: a wrong byte stops the stream there.
+#[test]
+fn a_wrong_mk4_ack_is_named_and_nothing_follows_it() {
+    let mut f = mk4_fixture(|k| Reply::Bytes(vec![if k == 5 { 0x5a } else { 0x11 }]));
+    let (result, states) = f.run("listener-a");
+    let total = mk4_image().num_chunks();
+    assert_eq!(
+        result,
+        Err(Mk4UpgradeError::Chunk(ChunkError::WrongAck {
+            chunk: 5,
+            of: total,
+            byte: 0x5a
+        }))
+    );
+    assert_eq!(states.len(), 5);
+    assert_eq!(f.chunk_writes().len(), 6, "no chunk after the bad ack");
+    f.assert_untouched_except(Some("listener-a"));
+}
+
+/// Two bytes for one chunk is wrong whatever the second is: a surplus `0x11`
+/// would be read as the next chunk's ack and shift every later ack by one, so the
+/// "final" ack would be the previous chunk's and not the digest verdict. It is
+/// caught at the chunk that produced it, and nothing more is written.
+#[test]
+fn an_extra_byte_after_an_ack_is_caught_at_its_own_chunk() {
+    for extra in [0x00, 0x11] {
+        let mut f = mk4_fixture(move |k| {
+            Reply::Bytes(if k == 2 { vec![0x11, extra] } else { vec![0x11] })
+        });
+        let (result, states) = f.run("listener-a");
+        assert_eq!(
+            result,
+            Err(Mk4UpgradeError::Chunk(ChunkError::SurplusAck {
+                chunk: 2,
+                of: mk4_image().num_chunks(),
+                pending: 1
+            })),
+            "extra byte {extra:#04x}"
+        );
+        assert_eq!(f.chunk_writes().len(), 3, "no chunk after the surplus");
+        assert!(states
+            .iter()
+            .all(|s| !matches!(s, Mk4UpgradeState::Staged { .. })));
+        f.assert_untouched_except(Some("listener-a"));
+    }
+}
+
+/// A surplus byte that arrives AFTER the final ack (the real verdict behind a
+/// shifted one) is caught by the quiet window: never `Staged`.
+#[test]
+fn a_late_byte_after_the_final_ack_is_not_a_stage() {
+    let total = mk4_image().num_chunks();
+    let rx: Arc<Mutex<Option<Pipe>>> = Default::default();
+    let late = rx.clone();
+    let mut f = mk4_fixture(move |k| {
+        if k + 1 == total {
+            let pipe = late.lock().unwrap().clone().expect("pipe set");
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                pipe.lock().unwrap().push(0x11);
+            });
+        }
+        Reply::Bytes(vec![0x11])
+    });
+    *rx.lock().unwrap() = Some(f.ports[2].1.to_coordinator.clone());
+    let (result, states) = f.run("listener-a");
+    assert_eq!(
+        result,
+        Err(Mk4UpgradeError::Chunk(ChunkError::SurplusAck {
+            chunk: total - 1,
+            of: total,
+            pending: 1
+        }))
+    );
+    assert!(states
+        .iter()
+        .all(|s| !matches!(s, Mk4UpgradeState::Staged { .. })));
+}
+
+/// A missing ack is named by WHERE it went missing: before admission took,
+/// mid-stream, or as the final digest verdict.
+#[test]
+fn a_missing_mk4_ack_is_named_by_where_it_went_missing() {
+    let total = mk4_image().num_chunks();
+    let silent_at = |n: u32| {
+        move |k: u32| {
+            if k == n {
+                Reply::Bytes(vec![])
+            } else {
+                Reply::Bytes(vec![0x11])
+            }
+        }
+    };
+
+    let mut f = mk4_fixture(silent_at(0));
+    assert_eq!(f.run("listener-a").0, Err(Mk4UpgradeError::NotAdmitted));
+    assert_eq!(f.chunk_writes().len(), 1);
+
+    let mut f = mk4_fixture(silent_at(10));
+    assert_eq!(
+        f.run("listener-a").0,
+        Err(Mk4UpgradeError::Chunk(ChunkError::Timeout {
+            chunk: 10,
+            of: total
+        }))
+    );
+    assert_eq!(f.chunk_writes().len(), 11);
+
+    let mut f = mk4_fixture(silent_at(total - 1));
+    let (result, states) = f.run("listener-a");
+    assert_eq!(
+        result,
+        Err(Mk4UpgradeError::StageNotConfirmed {
+            size: mk4_image().size()
+        }),
+        "every byte sent is not a stage: only the final ack is"
+    );
+    assert!(states
+        .iter()
+        .all(|s| !matches!(s, Mk4UpgradeState::Staged { .. })));
+    f.assert_untouched_except(Some("listener-a"));
+}
+
+#[test]
+fn an_mk4_disconnect_is_named() {
+    let mut f = mk4_fixture(|k| {
+        if k == 7 {
+            Reply::HangUp
+        } else {
+            Reply::Bytes(vec![0x11])
+        }
+    });
+    let (result, _) = f.run("listener-a");
+    assert!(
+        matches!(
+            result,
+            Err(Mk4UpgradeError::Chunk(ChunkError::Disconnected {
+                chunk: 7,
+                ..
+            }))
+        ),
+        "{result:?}"
+    );
+    assert_eq!(f.chunk_writes().len(), 8);
+}
+
+/// Unsupported peers are refused by name before a byte moves: a port with an
+/// ESP32 on it, a port with an Mk4 in its normal session (it refuses upgrade
+/// messages there and could not say so), and a port that is not ready.
+#[test]
+fn ports_that_are_not_upgrade_listeners_are_refused_before_any_byte() {
+    let mut f = mk4_fixture(ack);
+    for port in ["port-esp32", "port-mk4-session"] {
+        let (result, _) = f.run(port);
+        assert_eq!(
+            result,
+            Err(Mk4UpgradeError::NotAnUpgradeListener {
+                port: port.into(),
+                announced: 1
+            })
+        );
+    }
+    let (result, _) = f.run("no-such-port");
+    assert_eq!(
+        result,
+        Err(Mk4UpgradeError::PortNotReady {
+            port: "no-such-port".into()
+        })
+    );
+    f.assert_untouched_except(None);
+    assert_eq!(f.manager.mk4_upgrade_ports(), ["listener-a", "listener-b"]);
+}
+
+/// The outcome states cannot be skipped: a reconnect after staging alone is not
+/// an installation however its digest reads, and after an install request only
+/// the staged digest counts. (A mock of the task-07 peer's half; no peer in
+/// this tree can accept an install request.)
+#[test]
+fn installed_is_only_reachable_through_request_and_matching_reconnect() {
+    let fw = mk4_image();
+    let staged = Mk4UpgradeState::Staged {
+        size: fw.size(),
+        digest: fw.digest(),
+    };
+    assert!(staged.clone().reconnected(MK4, fw.digest()).is_err());
+
+    let requested = staged.install_requested().expect("staged -> requested");
+    assert!(!requested.is_installed());
+    assert!(requested.clone().install_requested().is_err());
+    assert!(requested.clone().reconnected(MK4, mk4_digest()).is_err());
+    let installed = requested
+        .reconnected(MK4, fw.digest())
+        .expect("the staged digest reconnected");
+    assert!(installed.is_installed());
 }

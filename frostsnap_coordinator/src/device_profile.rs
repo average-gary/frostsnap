@@ -148,6 +148,7 @@ impl DeviceProfile {
                 backup: true,
                 erase: true,
                 update_mode: true,
+                host_image_update: false,
                 factory_attestation: FactoryAttestation::NotChecked,
                 max_keygen_devices: None,
             },
@@ -164,6 +165,9 @@ impl DeviceProfile {
                 // `firmware/src/lib.rs:1070`. The Mk4 upgrade path is entered by
                 // a physical key hold on the device, not by this app.
                 update_mode: false,
+                // Its pre-Session listener (cold-snap `firmware/src/upgrade.rs`
+                // `run`, entered by holding OK at power-up) stages a checked image.
+                host_image_update: true,
                 // `CoordinatorSendBody::Challenge` is refused: no ESP32 DS
                 // peripheral and no factory certificate (cold-snap
                 // `firmware/src/lib.rs:184-187,1072`).
@@ -182,6 +186,7 @@ impl DeviceProfile {
                 backup: false,
                 erase: false,
                 update_mode: false,
+                host_image_update: false,
                 factory_attestation: FactoryAttestation::Unsupported,
                 max_keygen_devices: None,
             },
@@ -223,6 +228,10 @@ pub struct DeviceCapabilities {
     /// False means this app has no way to update the device and must not send it
     /// upgrade bytes — not that the device cannot be updated at all.
     pub update_mode: bool,
+    /// Takes a checked image file from this host through its own upgrade
+    /// listener (`UsbSerialManager::run_mk4_upgrade`), entered on the device and
+    /// addressed by port, never through `update_mode`'s device-keyed flow.
+    pub host_image_update: bool,
     pub factory_attestation: FactoryAttestation,
     /// Declared keygen party ceiling. `None` means this profile declares none.
     pub max_keygen_devices: Option<u16>,

@@ -141,6 +141,33 @@ impl<D: Direction> FramedSerialPort<D> {
         Ok(())
     }
 
+    /// Throw away every byte already received: the `BufReader`'s fill AND whatever
+    /// the port has queued. Returns how many bytes went.
+    ///
+    /// For the framed-to-raw switch. `read_for_magic_bytes` consumes only up to the
+    /// first `MAGIC_REPLY` it matches and `anything_to_read` asks the PORT, not the
+    /// buffer, so a second reply can sit in the fill forever — and the first raw
+    /// byte read after it (`MAGIC_REPLY` starts `0x00`) would be taken as an ack.
+    /// Does not wait: bytes still in flight are not seen here.
+    pub fn discard_input(&mut self) -> Result<usize, std::io::Error> {
+        let mut dropped = 0;
+        loop {
+            let buffered = self.inner.buffer().len();
+            self.inner.consume(buffered);
+            dropped += buffered;
+            if self.inner.get_ref().bytes_to_read()? == 0 {
+                return Ok(dropped);
+            }
+            self.inner.fill_buf()?;
+        }
+    }
+
+    /// How many received bytes are waiting: the `BufReader`'s fill plus what the
+    /// port has queued. Does not read or wait.
+    pub fn pending_input(&self) -> Result<usize, std::io::Error> {
+        Ok(self.inner.buffer().len() + self.inner.get_ref().bytes_to_read()? as usize)
+    }
+
     pub fn discard_all_messages(&mut self) -> Result<(), bincode::error::DecodeError> {
         while self.anything_to_read() || !self.inner.buffer().is_empty() {
             let _message: ReceiveSerial<D> =
@@ -269,6 +296,49 @@ impl Serial for DesktopSerial {
                     PortOpenError::Other(Box::new(e))
                 }
             })
+    }
+}
+
+/// One port, named by the caller, and nothing else: the updater CLI's transport.
+///
+/// NEVER DISCOVERS. `available_ports` is exactly the path given, so nothing a
+/// `UsbSerialManager` does can reach a port the operator did not name — no
+/// auto-selection of whatever happens to be plugged in. It declares the cold-snap
+/// VID/PID for that one path because naming it IS the operator's declaration.
+///
+/// Opened at baud 0: USB CDC has no line rate, and on macOS a non-zero rate is an
+/// IOSSIOSPEED ioctl that fails with ENOTTY on a pty (`serialport`'s own
+/// posix/termios.rs), which would make the CLI untestable on virtual ports.
+#[derive(Clone, Debug)]
+pub struct ExplicitPort {
+    path: String,
+}
+
+impl ExplicitPort {
+    pub fn new(path: impl Into<String>) -> Self {
+        Self { path: path.into() }
+    }
+}
+
+impl Serial for ExplicitPort {
+    fn available_ports(&self) -> Vec<PortDesc> {
+        vec![PortDesc {
+            id: self.path.clone(),
+            vid: crate::usb_serial_manager::USB_VID,
+            pid: crate::usb_serial_manager::USB_PID,
+        }]
+    }
+
+    fn open_device_port(&self, id: &str, _baud_rate: u32) -> Result<SerialPort, PortOpenError> {
+        if id != self.path {
+            return Err(PortOpenError::Other(
+                format!("{id} is not the port this updater was told to use").into(),
+            ));
+        }
+        serialport::new(id, 0)
+            .timeout(Duration::from_millis(5_000))
+            .open()
+            .map_err(|e| PortOpenError::Other(Box::new(e)))
     }
 }
 

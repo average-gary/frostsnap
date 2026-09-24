@@ -21,6 +21,9 @@ nusb = { version = "0.2", features = ["tokio"] }
 sha2 = { workspace = true, features = ["oid"] }
 rsa.workspace = true
 serde = { version = "1.0", features = ["derive"] }
+# Mk4 dev-key-0 wrapper signature check (`mk4_firmware`). Already in the graph
+# at this exact version through schnorr_fun `libsecp_compat_0_29`.
+secp256k1 = "0.29"
 
 bdk_chain = { version = "0.23.3", features = ["rusqlite"] }
 bdk_electrum_streaming = { version = "0.5.3" }

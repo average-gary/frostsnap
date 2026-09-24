@@ -359,6 +359,11 @@ mod test {
         assert!(!mk4.erase, "the Mk4 refuses DataErase");
         assert!(esp32.erase);
         assert!(!mk4.update_mode, "the Mk4 refuses every upgrade message");
+        assert!(
+            mk4.host_image_update,
+            "the Mk4 takes an image through its own upgrade listener"
+        );
+        assert!(!esp32.host_image_update, "the ESP32 path is update_mode's");
         assert_eq!(mk4.factory_attestation, FactoryAttestation::Unsupported);
         assert_eq!(esp32.factory_attestation, FactoryAttestation::NotChecked);
         assert!(
