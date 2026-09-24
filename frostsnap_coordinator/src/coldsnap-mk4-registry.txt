@@ -28,3 +28,4 @@
 # Format: one revision per line -- `<announced digest, 64 lowercase hex> <label>`.
 
 58f1b3fe4cd2df9e38b93dda2a1224c8d7652ef89e0c10d38d5a46f04e39f441 mk4-2026-09-21
+d660d179ed78c6c858c0b8b7092e529bc6ec0beb4b560f192826c68d74f674a0 mk4-2026-09-24
