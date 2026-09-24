@@ -1131,9 +1131,10 @@ impl FfiCoordinator {
     }
 
     pub fn erase_device(&self, id: DeviceId, sink: impl Sink<EraseDeviceState>) -> Result<()> {
-        // A cold-snap Mk4 answers `DataErase` with `Refusal::DataErase` and has no
-        // way to tell us, so the erase would sit there looking like it worked.
-        // Refused here so a direct bridge call cannot get past it either.
+        // Firmware that refuses `DataErase` has no way to tell us, so the erase
+        // would sit there looking like it worked. Refused here so a direct bridge
+        // call cannot get past it either. (A cold-snap Mk4 no longer refuses: since
+        // task 08 it asks on its own glass and declares `erase: true`.)
         let device = self
             .device_list
             .lock()

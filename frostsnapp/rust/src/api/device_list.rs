@@ -356,7 +356,7 @@ mod test {
         let mk4 = connected(mk4_digest(), None).capabilities();
         let esp32 = connected(unknown(), Some(unknown())).capabilities();
 
-        assert!(!mk4.erase, "the Mk4 refuses DataErase");
+        assert!(mk4.erase, "the Mk4 asks on its own glass before erasing");
         assert!(esp32.erase);
         assert!(!mk4.update_mode, "the Mk4 refuses every upgrade message");
         assert!(

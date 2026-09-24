@@ -157,9 +157,12 @@ impl DeviceProfile {
                 // `DisplayBackup`, the restore flow and `CheckBackup` are all
                 // admitted (cold-snap `firmware/src/lib.rs:1136,1184,1239`).
                 backup: true,
-                // `CoordinatorSendBody::DataErase` is refused —
-                // `Refusal::DataErase`, cold-snap `firmware/src/lib.rs:1071`.
-                erase: false,
+                // `CoordinatorSendBody::DataErase` raises a consent question on
+                // the device's own glass (cold-snap `firmware/src/lib.rs:1185`);
+                // only a physical digit there runs the resumable erase, which
+                // sends `EraseConfirmed` after deletion and resets as a new
+                // device (`firmware/src/lib.rs:968`).
+                erase: true,
                 // All three `CoordinatorUpgradeMessage` variants are refused —
                 // `Refusal::FirmwareUpgrade`, cold-snap
                 // `firmware/src/lib.rs:1070`. The Mk4 upgrade path is entered by

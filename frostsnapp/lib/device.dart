@@ -197,8 +197,8 @@ class _DeviceDetailsState extends State<DeviceDetails> {
           // the wire, so an ungated button would look like it had worked.
           subtitle: Text(
             capabilities.erase
-                ? 'Delete everything from this device'
-                : 'This device erases itself from its own menu, not from the app',
+                ? 'Delete everything from this device (approve on its screen)'
+                : 'This device does not accept an erase request from the app',
           ),
           leading: Icon(Icons.delete_forever_rounded),
           enabled: capabilities.erase,
@@ -495,6 +495,8 @@ class _DeviceDetailsState extends State<DeviceDetails> {
       }
 
       // `Confirmed` means the device has *started* erasing, not finished.
+      // (A cold-snap Mk4 sends it only AFTER its flash is blank and then
+      // resets; it comes back under a new id with no shares and no name.)
       // Don't remove from action-needed here — instead wait for the device
       // to actually disconnect (erase complete → device blank → USB drop),
       // which drops `shouldShow` to false and auto-dismisses the dialog.

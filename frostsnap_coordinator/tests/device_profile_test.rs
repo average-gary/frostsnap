@@ -148,7 +148,11 @@ fn mk4_and_esp32_capabilities_differ() {
     );
     assert!(backup, "the Mk4 displays and accepts a physical backup");
     assert!(features.check_backup, "and answers the check-backup quiz");
-    assert!(!erase, "DataErase is refused: Refusal::DataErase");
+    assert!(
+        erase,
+        "DataErase raises a consent question on the Mk4's glass and an approved erase \
+         answers EraseConfirmed"
+    );
     assert!(
         !update_mode,
         "every CoordinatorUpgradeMessage is refused: Refusal::FirmwareUpgrade"

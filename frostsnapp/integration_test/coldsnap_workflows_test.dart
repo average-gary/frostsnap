@@ -342,8 +342,9 @@ void main() {
           12,
           reason: 'the declared keygen ceiling is a capability of the firmware',
         );
-        // A cold-snap device refuses `DataErase` and every upgrade message on the wire.
-        expect(device.capabilities().erase, isFalse);
+        // A cold-snap device asks on its own glass before erasing (task 08) and
+        // refuses every upgrade message on the wire.
+        expect(device.capabilities().erase, isTrue);
         expect(device.capabilities().updateMode, isFalse);
         expect(device.capabilities().backup, isTrue);
       }
@@ -1106,6 +1107,120 @@ void main() {
         coord.accessStructuresInvolvingDevice(deviceId: victim),
         isNotEmpty,
       );
+    },
+    timeout: const Timeout(Duration(minutes: 3)),
+  );
+
+  // TASK 08. LAST, because it destroys rig device 1's share and every test above needs
+  // it. What it drives is the app's own erase path (`device.dart`'s erase dialog), minus
+  // the widgets: the same `eraseDevice` stream, the same `deleteShare` on `Confirmed`,
+  // and the same dismissal condition -- the OLD id leaving the device list. The widget
+  // tree is not pumped here, so the dialog itself is not rendered; its inputs are.
+  test(
+    'erase: a declined question writes nothing, an approved one confirms only after '
+    'deletion, and the reset device comes back blank under a new id',
+    () async {
+      expect(
+        requireEnv('COLDSNAP_RIG_ERASE').split(','),
+        contains('1'),
+        reason: 'run under tools/app-rig-test.sh, which passes --erase 1',
+      );
+      final victim = idOf(1);
+      final victimHex = victim.toHex();
+      expect(coord.getConnectedDevice(id: victim)!.capabilities().erase, isTrue);
+      expect(coord.accessStructuresInvolvingDevice(deviceId: victim), isNotEmpty);
+
+      // 1. DECLINED AT THE GLASS. The protocol has no refusal message, so the app's
+      // dialog stays on `WaitingForConfirmation` until the human cancels it; the Cancel
+      // button's own calls (`sendCancel`) end it here, plus the protocol cancel.
+      final declined = <EraseDeviceState>[];
+      final declineSub = coord
+          .eraseDevice(deviceId: victim)
+          .listen(declined.add);
+      try {
+        await until<bool>(
+          'device 1 to decline its first erase question at its glass',
+          () => deviceLog(1).contains('DECLINED DataErase') ? true : null,
+        );
+      } finally {
+        await coord.sendCancel(id: victim);
+        letGo(declineSub, cancelProtocol: true);
+      }
+      expect(declined, isNot(contains(EraseDeviceState.confirmed)));
+      expect(deviceLog(1), isNot(contains('ERASED')));
+      final kept = coord.getConnectedDevice(id: victim);
+      expect(kept, isNotNull, reason: 'a declined erase must not reset the device');
+      expect(kept!.name, 'rig-device-1');
+      expect(coord.accessStructuresInvolvingDevice(deviceId: victim), isNotEmpty);
+
+      // 2. APPROVED. `Confirmed` is the late ack: a cold-snap Mk4 sends
+      // `EraseConfirmed` only after every sensitive page reads back blank, where
+      // upstream sends it after the first sector.
+      final states = <EraseDeviceState>[];
+      final eraseSub = coord.eraseDevice(deviceId: victim).listen(states.add);
+      try {
+        await until<bool>(
+          'EraseConfirmed from device 1 after its second, approved question',
+          () => states.contains(EraseDeviceState.confirmed) ? true : null,
+        );
+      } finally {
+        letGo(eraseSub);
+      }
+      // The stub logs the deletion BEFORE it writes the ack to the wire.
+      expect(deviceLog(1), contains('ERASED on the randomised digit'));
+      final reset = RegExp(
+        r'RESET after erase and rebuilt from flash as (?:DeviceId\()?([0-9a-f]+)\)?: '
+        r'0 shares, no name',
+      ).firstMatch(deviceLog(1));
+      expect(reset, isNotNull, reason: 'device 1 must have rebuilt itself blank');
+      final freshHex = reset!.group(1)!;
+      expect(freshHex, isNot(victimHex));
+
+      // The dialog's own step on `Confirmed` (`device.dart`): drop the device's share
+      // from every access structure it was in.
+      for (final ref in coord.accessStructuresInvolvingDevice(deviceId: victim)) {
+        await coord.deleteShare(accessStructureRef: ref, deviceId: victim);
+      }
+      expect(coord.accessStructuresInvolvingDevice(deviceId: victim), isEmpty);
+
+      // 3. THE RESET'S USB DROP. The dialog ("Waiting for device reset") dismisses only
+      // when the OLD id leaves the device list. A real unit's reset drops USB; the stub
+      // cannot drop one pty for one of its sessions, so the old id is still listed
+      // until the port goes -- which is the latency the dialog has to sit through.
+      expect(
+        coord.getConnectedDevice(id: victim),
+        isNotNull,
+        reason: 'the stub models no USB drop; only the unplug below removes the old id',
+      );
+      final manifest = File(manifestPath);
+      final lines = manifest.readAsLinesSync();
+      final port = File('$rigDir/identities.tsv')
+          .readAsLinesSync()
+          .firstWhere((l) => l.contains(victimHex))
+          .split('\t')
+          .first;
+      manifest.writeAsStringSync(
+        lines.where((l) => l != port).join('\n') + '\n',
+      );
+      await until<bool>(
+        'the erased device\'s old id to leave the device list (dialog dismissal)',
+        () => coord.getConnectedDevice(id: victim) == null ? true : null,
+      );
+      manifest.writeAsStringSync(lines.join('\n') + '\n');
+      final fresh = await until<ConnectedDevice>(
+        'the erased device to come back under its NEW id',
+        () {
+          for (final d in coord.deviceListState().devices) {
+            if (d.id.toHex() == freshHex) return d;
+          }
+          return null;
+        },
+      );
+      expect(fresh.name, isNull, reason: 'an erased device has no name');
+      expect(fresh.isCompatible(), isTrue);
+      expect(coord.accessStructuresInvolvingDevice(deviceId: fresh.id), isEmpty);
+      expect(coord.getConnectedDevice(id: victim), isNull,
+          reason: 'the old identity must never come back');
     },
     timeout: const Timeout(Duration(minutes: 3)),
   );
