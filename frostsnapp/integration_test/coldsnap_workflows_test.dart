@@ -43,6 +43,7 @@ import 'dart:typed_data';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:integration_test/integration_test.dart';
 
+import 'package:frostsnap/device.dart' show dropErasedDeviceShares;
 import 'package:frostsnap/id_ext.dart';
 import 'package:frostsnap/src/rust/api.dart';
 import 'package:frostsnap/src/rust/api/backup_run.dart';
@@ -1176,11 +1177,10 @@ void main() {
       final freshHex = reset!.group(1)!;
       expect(freshHex, isNot(victimHex));
 
-      // The dialog's own step on `Confirmed` (`device.dart`): drop the device's share
-      // from every access structure it was in.
-      for (final ref in coord.accessStructuresInvolvingDevice(deviceId: victim)) {
-        await coord.deleteShare(accessStructureRef: ref, deviceId: victim);
-      }
+      // The dialog's own step on `Confirmed` (`device.dart`'s `dropErasedDeviceShares`,
+      // the function the dialog calls): drop the device's share from every access
+      // structure it was in.
+      await dropErasedDeviceShares(coord, victim);
       expect(coord.accessStructuresInvolvingDevice(deviceId: victim), isEmpty);
 
       // 3. THE RESET'S USB DROP. The dialog ("Waiting for device reset") dismisses only
@@ -1223,6 +1223,144 @@ void main() {
           reason: 'the old identity must never come back');
     },
     timeout: const Timeout(Duration(minutes: 3)),
+  );
+
+  // FIX 2a. An erase CUT BY A POWER LOSS, at every point the rig scripts
+  // (`tools/app-rig-test.sh --erase-cut N:KEYS`, `stub.rs::erase_keys`):
+  //   p  before the marker commits: the device reboots as ITSELF with its share, and
+  //      the app keeps the share (fail closed) -- nothing is confirmed;
+  //   c  after the commit and one share sector, no ack sent;
+  //   a  after deletion with EraseConfirmed still in RAM, lost unwritten;
+  //   f  in `finish`, after EraseConfirmed was written (confirmed at once; the boot's
+  //      second ack is a duplicate nobody claims).
+  // For c/a/f boot's `erase::recover` finishes the erase and acks from the ORIGINAL
+  // id before announcing a fresh one; the app's `EraseDevice` (no disconnect
+  // handler) confirms through the same arm as the test above, and the dialog's own
+  // `dropErasedDeviceShares` drops the share. Host stub over ptys with fake flash: a
+  // manifest unplug models the USB drop; no STM32 erase physics.
+  test(
+    'erase cut by a power loss at every scripted point: a committed one is finished '
+    'at boot and the app drops the share under the old id, an uncommitted one keeps it',
+    () async {
+      final specs = requireEnv('COLDSNAP_RIG_ERASE_CUT').split(',');
+      expect(specs, isNotEmpty, reason: 'run under tools/app-rig-test.sh (--erase-cut)');
+      final manifest = File(manifestPath);
+      final lines = manifest.readAsLinesSync();
+      int count(int rigIndex, String what) => what.allMatches(deviceLog(rigIndex)).length;
+
+      Future<void> cycle(int rigIndex, DeviceId victim, String kind) async {
+        final victimHex = victim.toHex();
+        expect(coord.getConnectedDevice(id: victim)!.capabilities().erase, isTrue);
+        expect(coord.accessStructuresInvolvingDevice(deviceId: victim), isNotEmpty);
+        final cutMark = 'POWER CUT mid-erase [$kind]';
+        final cuts = count(rigIndex, cutMark);
+        final recoveries = count(rigIndex, 'erase::recover FINISHED the cut erase at boot');
+        final keptBoots = count(rigIndex, 'rebooted after a pre-commit power cut');
+        final states = <EraseDeviceState>[];
+        final eraseSub = coord.eraseDevice(deviceId: victim).listen(states.add);
+        var confirmed = 0;
+        try {
+          await until<bool>(
+            'device $rigIndex to lose power mid-erase [$kind]',
+            () => count(rigIndex, cutMark) > cuts ? true : null,
+          );
+          if (kind == 'f') {
+            // The ack was written before the cut: confirmed now, before any reboot.
+            await until<bool>(
+              'EraseConfirmed written before the cut in finish',
+              () => states.contains(EraseDeviceState.confirmed) ? true : null,
+            );
+          } else {
+            // No ack left the device: nothing may be confirmed and nothing dropped.
+            await Future<void>.delayed(const Duration(seconds: 1));
+            expect(states, isNot(contains(EraseDeviceState.confirmed)),
+                reason: '[$kind] confirmed with no ack on the wire');
+            expect(coord.accessStructuresInvolvingDevice(deviceId: victim), isNotEmpty);
+          }
+
+          // The power cut drops USB: unplug, and the old id leaves the device list.
+          final port = File('$rigDir/identities.tsv')
+              .readAsLinesSync()
+              .firstWhere((l) => l.contains(victimHex))
+              .split('\t')
+              .first;
+          manifest.writeAsStringSync(
+            lines.where((l) => l != port).join('\n') + '\n',
+          );
+          await until<bool>(
+            'the powered-off device\'s old id to leave the device list [$kind]',
+            () => coord.getConnectedDevice(id: victim) == null ? true : null,
+          );
+          if (kind != 'f') expect(states, isNot(contains(EraseDeviceState.confirmed)));
+
+          // Power back: boot, reconnect.
+          manifest.writeAsStringSync(lines.join('\n') + '\n');
+          if (kind == 'p') {
+            await until<bool>(
+              'device $rigIndex to boot back as itself after a pre-commit cut',
+              () => count(rigIndex, 'rebooted after a pre-commit power cut') > keptBoots &&
+                      coord.getConnectedDevice(id: victim) != null
+                  ? true
+                  : null,
+            );
+            await Future<void>.delayed(const Duration(seconds: 1));
+            expect(states, isNot(contains(EraseDeviceState.confirmed)),
+                reason: 'a pre-commit cut confirmed an erase that never happened');
+            expect(coord.accessStructuresInvolvingDevice(deviceId: victim), isNotEmpty,
+                reason: 'fail closed: an uncommitted erase keeps the share');
+            return;
+          }
+          await until<bool>(
+            'boot recovery and EraseConfirmed from device $rigIndex\'s old id [$kind]',
+            () => count(rigIndex, 'erase::recover FINISHED the cut erase at boot') >
+                        recoveries &&
+                    states.contains(EraseDeviceState.confirmed)
+                ? true
+                : null,
+          );
+          confirmed = states.where((s) => s == EraseDeviceState.confirmed).length;
+        } finally {
+          letGo(eraseSub, cancelProtocol: kind == 'p');
+        }
+        expect(confirmed, 1, reason: '[$kind] one confirmation, a duplicate ack claims nothing');
+        await dropErasedDeviceShares(coord, victim);
+        expect(coord.accessStructuresInvolvingDevice(deviceId: victim), isEmpty,
+            reason: '[$kind] the app still holds the erased device\'s share');
+
+        final recovered = RegExp(
+          r'rebuilt from flash as (?:DeviceId\()?([0-9a-f]+)\)?: 0 shares, no name',
+        ).allMatches(deviceLog(rigIndex)).last;
+        final freshHex = recovered.group(1)!;
+        expect(freshHex, isNot(victimHex));
+        final fresh = await until<ConnectedDevice>(
+          'the recovered device to come back under its NEW id [$kind]',
+          () {
+            for (final d in coord.deviceListState().devices) {
+              if (d.id.toHex() == freshHex) return d;
+            }
+            return null;
+          },
+        );
+        expect(fresh.name, isNull, reason: 'an erased device has no name');
+        expect(coord.accessStructuresInvolvingDevice(deviceId: fresh.id), isEmpty);
+        expect(coord.getConnectedDevice(id: victim), isNull,
+            reason: 'the old identity must never come back');
+      }
+
+      final kinds = <String>[];
+      for (final spec in specs) {
+        final parts = spec.split(':');
+        final rigIndex = int.parse(parts[0]);
+        for (final kind in parts[1].split('')) {
+          kinds.add(kind);
+          // Every scripted key but the last is `p`, which keeps the same id.
+          await cycle(rigIndex, idOf(rigIndex), kind);
+        }
+      }
+      expect(kinds.toSet(), containsAll(<String>['p', 'c', 'a', 'f']),
+          reason: 'every scripted cut point must be driven end to end');
+    },
+    timeout: const Timeout(Duration(minutes: 8)),
   );
 }
 

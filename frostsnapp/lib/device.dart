@@ -482,13 +482,7 @@ class _DeviceDetailsState extends State<DeviceDetails> {
 
       await for (final state in stream) {
         if (state == EraseDeviceState.confirmed) {
-          final accessStructureRefs = coord.accessStructuresInvolvingDevice(
-            deviceId: id,
-          );
-          for (final ref in accessStructureRefs) {
-            removedFromWallet = coord.getFrostKey(keyId: ref.keyId)?.keyName();
-            await coord.deleteShare(accessStructureRef: ref, deviceId: id);
-          }
+          removedFromWallet = await dropErasedDeviceShares(coord, id);
           _eraseConfirmed.value = true;
           break;
         }
@@ -557,4 +551,18 @@ class _DeviceDetailsState extends State<DeviceDetails> {
       ),
     );
   }
+}
+
+/// The erase dialog's step on `EraseDeviceState.confirmed`: drop [id]'s share from
+/// every access structure it is in, and return the name of the last wallet it was
+/// removed from. The same for every `EraseConfirmed`, including the one a cold-snap
+/// Mk4 sends from its OLD id after boot recovery finished an erase a power cut
+/// interrupted (it reconnects under a new id, and `EraseDevice` is still waiting).
+Future<String?> dropErasedDeviceShares(Coordinator coord, DeviceId id) async {
+  String? removedFromWallet;
+  for (final ref in coord.accessStructuresInvolvingDevice(deviceId: id)) {
+    removedFromWallet = coord.getFrostKey(keyId: ref.keyId)?.keyName();
+    await coord.deleteShare(accessStructureRef: ref, deviceId: id);
+  }
+  return removedFromWallet;
 }
