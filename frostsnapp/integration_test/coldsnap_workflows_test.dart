@@ -29,6 +29,11 @@
 // first reply is lost on the wire (`--lose-first-share`, a rig fault injection) so the
 // replug + re-sent request drives the core's at-most-once rule end to end.
 //
+// THE APP IS RESTARTED: this file runs as two app processes (`COLDSNAP_RIG_APP_RUN` 1, 2;
+// `tools/app-rig.py --app-restart`) over one app dir while the stubs stay up. Run 2
+// reloads the wallet from sqlite/bdk, checks it against what run 1 recorded, and signs
+// with it. A stub PROCESS restart is not covered: FakeFlash lives in memory.
+//
 // WHAT IT DOES NOT COVER, because no software rig can: USB enumeration and the OTG_FS
 // register sequences, SSD1306 init/timing and physical legibility, keypad scan/debounce
 // and its randomised timing, the callgate, the TRNG's two sources, panic/reset recovery,
@@ -94,6 +99,18 @@ String requireEnv(String name) {
 late final String manifestPath = requireEnv('FROSTSNAP_TEST_SERIAL_PORTS');
 late final String rigDir = requireEnv('COLDSNAP_RIG_DIR');
 late final String coldsnapRepo = requireEnv('COLDSNAP_REPO');
+
+/// WHICH APP PROCESS THIS IS. `tools/app-rig.py --app-restart` runs this file twice against
+/// the same stubs and the same app dir: run `1` starts from an empty app dir and does the
+/// keygen, signing, restoration and replug workflows; its whole process group is reaped;
+/// run `2` is a NEW app process that loads what run 1 persisted (sqlite + bdk), checks it
+/// against [restartSnapshotPath], signs with it, and then does the destructive erase
+/// workflows. The stubs are not restarted: their FakeFlash is in memory.
+late final String appRun = requireEnv('COLDSNAP_RIG_APP_RUN');
+
+/// Written by run 1 just before it exits, countersigned (`reloadedByPid`) by run 2 once the
+/// reloaded wallet has signed; `tools/app-rig.py` exits 6 without the countersignature.
+late final String restartSnapshotPath = '$rigDir/app-restart.json';
 
 /// Run one of cold-snap's rig tools and insist it succeeded.
 ///
@@ -204,6 +221,24 @@ Future<T> until<T>(
 
 void main() {
   IntegrationTestWidgetsFlutterBinding.ensureInitialized();
+  if (appRun != '1' && appRun != '2') {
+    throw StateError('COLDSNAP_RIG_APP_RUN is "$appRun"; want 1 or 2');
+  }
+
+  /// A test that runs only in the given app process (see [appRun]).
+  void inRun(
+    String run,
+    Object description,
+    dynamic Function() body, {
+    Timeout? timeout,
+  }) {
+    if (appRun == run) test(description, body, timeout: timeout);
+  }
+
+  void firstApp(Object d, dynamic Function() b, {Timeout? timeout}) =>
+      inRun('1', d, b, timeout: timeout);
+  void secondApp(Object d, dynamic Function() b, {Timeout? timeout}) =>
+      inRun('2', d, b, timeout: timeout);
 
   late Api api;
   late Coordinator coord;
@@ -265,8 +300,21 @@ void main() {
     // coordinator's sqlite DB and the bdk wallet files derive from it, so nothing here
     // can reach the real `getApplicationSupportDirectory()` wallet.
     final appDir = Directory('$rigDir/app-dir');
-    if (appDir.existsSync()) appDir.deleteSync(recursive: true);
-    appDir.createSync(recursive: true);
+    if (appRun == '1') {
+      if (appDir.existsSync()) appDir.deleteSync(recursive: true);
+      appDir.createSync(recursive: true);
+      final stale = File(restartSnapshotPath);
+      if (stale.existsSync()) stale.deleteSync();
+    } else {
+      // THE RESTART: the same directory, read back, never wiped or recreated. An empty one
+      // means run 1 persisted nothing, and loading it would be a fresh wallet.
+      if (!appDir.existsSync() || appDir.listSync().isEmpty) {
+        throw StateError('RESTART: ${appDir.path} is missing or empty');
+      }
+      if (!File(restartSnapshotPath).existsSync()) {
+        throw StateError('RESTART: run 1 left no $restartSnapshotPath');
+      }
+    }
     final (coord_, appCtx) = await api.loadTestPtySerial(
       appDir: appDir.path,
       portManifest: manifestPath,
@@ -276,15 +324,18 @@ void main() {
     wallet = appCtx.settings.getSuperWallet(network: network);
     coord.startThread();
     // Corroboration only, and it is started here rather than asserted on: the pass
-    // criterion is the fixture plus the independent sighash recomputation.
-    await coldsnapTool('regtest.py', ['up']);
+    // criterion is the fixture plus the independent sighash recomputation. Once, in run 1:
+    // the node outlives the app restart like the stubs do, so run 2's spend of run 1's
+    // funding coin can still be judged by Core.
+    if (appRun == '1') await coldsnapTool('regtest.py', ['up']);
   });
 
   tearDownAll(() async {
     // Never leave a node or a datadir behind. `tools/app-rig.py`'s teardown runs the same
     // command on the same datadir (`COLDSNAP_REGTEST_DATADIR`) for the runs that never
     // reach here.
-    await coldsnapTool('regtest.py', ['down']);
+    // Run 1 leaves it up for run 2; if run 2 never starts, the rig's teardown stops it.
+    if (appRun == '2') await coldsnapTool('regtest.py', ['down']);
   });
 
   test(
@@ -353,7 +404,7 @@ void main() {
     timeout: const Timeout(Duration(minutes: 3)),
   );
 
-  test(
+  firstApp(
     'naming and a 2-of-3 keygen through the app\'s own APIs',
     () async {
       final wallet3 = [idOf(0), idOf(1), idOf(2)];
@@ -450,7 +501,7 @@ void main() {
     timeout: const Timeout(Duration(minutes: 3)),
   );
 
-  test(
+  firstApp(
     'the address on the device\'s glass is the one the app handed out',
     () async {
       final info = wallet.nextAddress(masterAppkey: masterAppkey!);
@@ -489,7 +540,7 @@ void main() {
     timeout: const Timeout(Duration(minutes: 3)),
   );
 
-  test(
+  firstApp(
     'a real transaction is built, signed at the glass, and verifies',
     () async {
       // A REAL regtest coin: `regtest.py fund` pays our address and confirms it, so Core
@@ -651,7 +702,7 @@ void main() {
     timeout: const Timeout(Duration(minutes: 5)),
   );
 
-  test(
+  firstApp(
     'a declined signing request yields no share at all',
     () async {
       final decliner = declineSigning.first;
@@ -726,7 +777,7 @@ void main() {
     timeout: const Timeout(Duration(minutes: 4)),
   );
 
-  test(
+  firstApp(
     'the blank device takes a backup off another device\'s glass',
     () async {
       final source = idOf(0);
@@ -821,7 +872,7 @@ void main() {
     },
     timeout: const Timeout(Duration(minutes: 5)),
   );
-  test('the blank device is restored from that backup and signs with it, '
+  firstApp('the blank device is restored from that backup and signs with it, '
       'at most once across a lost reply and a replug', () async {
     final blank = idOf(3);
     final source = idOf(0);
@@ -1073,7 +1124,7 @@ void main() {
     }
   }, timeout: const Timeout(Duration(minutes: 6)));
 
-  test(
+  firstApp(
     'unplug and replug preserves the identity and the wallet',
     () async {
       final manifest = File(manifestPath);
@@ -1112,12 +1163,221 @@ void main() {
     timeout: const Timeout(Duration(minutes: 3)),
   );
 
+  firstApp(
+    'before the restart: record what the next app process must reload',
+    () async {
+      final access = coord.getAccessStructure(asRef: asRef!)!;
+      final next = wallet.nextAddress(masterAppkey: masterAppkey!);
+      final utxos = wallet.utxoCount(masterAppkey: masterAppkey!);
+      // Non-trivial, or reloading it proves nothing: a revealed/used address frontier
+      // past 0, a coin, and a name and a share on every rig device.
+      expect(next.index, greaterThan(0), reason: 'no address was ever used');
+      expect(utxos, greaterThan(0));
+      final devices = <String, Object?>{};
+      for (var i = 0; i < 4; i++) {
+        final name = coord.getDeviceName(id: idOf(i));
+        final share = access.getDeviceShortShareIndex(deviceId: idOf(i));
+        expect(name, isNotNull, reason: 'rig device $i has no name to reload');
+        expect(
+          share,
+          isNotNull,
+          reason: 'rig device $i has no share to reload',
+        );
+        devices['$i'] = {'id': idOf(i).toHex(), 'name': name, 'share': share};
+      }
+      File(restartSnapshotPath).writeAsStringSync(
+        jsonEncode({
+          'pid': pid,
+          'keyId': asRef!.keyId.toHex(),
+          'accessStructureId': hex.encode(
+            asRef!.accessStructureId.field0.toList(),
+          ),
+          'keyName': coord.getFrostKey(keyId: asRef!.keyId)!.keyName(),
+          'threshold': access.threshold(),
+          'devices': devices,
+          'nextIndex': next.index,
+          'nextAddress': next.address.toString(),
+          'utxoCount': utxos,
+        }),
+      );
+    },
+  );
+
+  secondApp(
+    'after a real app restart: the wallet, its keys and device names are reloaded '
+    'from disk, and the next address is the one the first process derived',
+    () async {
+      final snap =
+          jsonDecode(File(restartSnapshotPath).readAsStringSync())
+              as Map<String, dynamic>;
+      // A NEW PROCESS, and the old one is gone -- not a widget rebuild or a reset.
+      expect(
+        pid,
+        isNot(snap['pid']),
+        reason: 'run 2 is the same process as run 1',
+      );
+      final probe = await Process.run('kill', ['-0', '${snap['pid']}']);
+      expect(
+        probe.exitCode,
+        isNot(0),
+        reason: 'the first app process ${snap['pid']} is still running',
+      );
+
+      // No keygen ran in this process: the one key is what the sqlite DB held.
+      final keys = coord.keyState().keys;
+      expect(
+        keys.map((k) => k.keyId().toHex()).toList(),
+        [snap['keyId']],
+        reason:
+            'the reloaded app does not hold exactly the first process\'s wallet',
+      );
+      final key = keys.single;
+      expect(key.keyName(), snap['keyName']);
+      final access = key.accessStructures().singleWhere(
+        (a) =>
+            hex.encode(
+              a.accessStructureRef().accessStructureId.field0.toList(),
+            ) ==
+            snap['accessStructureId'],
+      );
+      asRef = access.accessStructureRef();
+      masterAppkey = key.masterAppkey();
+      expect(access.threshold(), snap['threshold']);
+
+      final devices = (snap['devices'] as Map<String, dynamic>).map(
+        (k, v) => MapEntry(int.parse(k), v as Map<String, dynamic>),
+      );
+      for (final MapEntry(key: i, value: d) in devices.entries) {
+        final id = idOf(i);
+        expect(id.toHex(), d['id'], reason: 'rig device $i changed identity');
+        expect(
+          coord.getDeviceName(id: id),
+          d['name'],
+          reason: 'the coordinator DB did not reload rig device $i\'s name',
+        );
+        expect(
+          access.getDeviceShortShareIndex(deviceId: id),
+          d['share'],
+          reason: 'the reloaded access structure lost rig device $i\'s share',
+        );
+        await until<bool>(
+          'rig device $i to reconnect to the new app under its name',
+          () =>
+              coord.getConnectedDevice(id: id)?.name == d['name'] ? true : null,
+        );
+      }
+
+      // bdk: the address frontier and the coin came back off disk.
+      final next = wallet.nextAddress(masterAppkey: masterAppkey!);
+      expect(
+        next.index,
+        snap['nextIndex'],
+        reason: 'address frontier not reloaded',
+      );
+      expect(next.address.toString(), snap['nextAddress']);
+      expect(
+        wallet.utxoCount(masterAppkey: masterAppkey!),
+        snap['utxoCount'],
+        reason: 'the bdk wallet did not reload its coins',
+      );
+    },
+    timeout: const Timeout(Duration(minutes: 3)),
+  );
+
+  secondApp(
+    'after the restart: the reloaded wallet builds a transaction and the devices sign it',
+    () async {
+      // NO funding here: the only coin is the one run 1's process was handed, reloaded
+      // from bdk, and still unspent on the regtest node that outlived the restart.
+      final foreign = await coldsnapTool('regtest.py', ['newaddress']);
+      final build = wallet.buildTx(coord: coord, masterAppkey: masterAppkey!)!;
+      build.setConfirmationTarget(
+        target: const ConfirmationTarget.custom(feerate),
+      );
+      build.setRecipientWithUri(recipient: 0, uri: foreign);
+      build.setAmount(recipient: 0, amount: sendSats ~/ 3);
+      final plan = build.tryFinish();
+      final inputCount = plan.inputCount();
+      final unsigned = wallet.commitSend(coord: coord, plan: plan);
+
+      final signers = [idOf(0), idOf(1)];
+      for (final id in signers) {
+        expect(
+          coord.noncesAvailable(id: id),
+          greaterThan(0),
+          reason: 'the coordinator DB did not reload ${id.toHex()}\'s nonces',
+        );
+      }
+      final before = {
+        for (final i in [0, 1]) i: glassRows(i).length,
+      };
+      final states = <SigningState>[];
+      final sub = coord
+          .startSigningTx(
+            accessStructureRef: asRef!,
+            unsignedTx: unsigned,
+            devices: signers,
+          )
+          .listen(states.add);
+      try {
+        final session = await until<SigningState>(
+          'the signing session to open',
+          () => states.isEmpty ? null : states.last,
+        );
+        await requestSharesFrom(signers, states, session.sessionId);
+        final done = await until<SigningState>(
+          '$threshold signature shares after the restart',
+          () {
+            final last = states.last;
+            if (last.aborted != null) {
+              throw StateError('signing ABORTED: ${last.aborted}');
+            }
+            return last.finishedSignatures != null ? last : null;
+          },
+        );
+        for (final i in [0, 1]) {
+          final flat = glassRows(
+            i,
+          ).skip(before[i]!).join().replaceAll(RegExp(r'\s'), '');
+          expect(
+            flat,
+            contains(foreign),
+            reason: 'device $i: no recipient on glass',
+          );
+          expect(
+            flat,
+            contains('${sendSats ~/ 3}'),
+            reason: 'device $i: no amount',
+          );
+        }
+        final signed = await unsigned.withSignatures(
+          signatures: done.finishedSignatures!,
+        );
+        // Independent BIP-341 recomputation over the prevouts the RELOADED wallet holds.
+        expect(wallet.verifyTaprootSignatures(tx: signed), inputCount);
+        await coldsnapTool('regtest.py', [
+          'accept',
+          wallet.testTxHex(tx: signed),
+        ]);
+      } finally {
+        letGo(sub);
+      }
+      final snap =
+          jsonDecode(File(restartSnapshotPath).readAsStringSync())
+              as Map<String, dynamic>;
+      File(
+        restartSnapshotPath,
+      ).writeAsStringSync(jsonEncode({...snap, 'reloadedByPid': pid}));
+    },
+    timeout: const Timeout(Duration(minutes: 5)),
+  );
+
   // TASK 08. LAST, because it destroys rig device 1's share and every test above needs
   // it. What it drives is the app's own erase path (`device.dart`'s erase dialog), minus
   // the widgets: the same `eraseDevice` stream, the same `deleteShare` on `Confirmed`,
   // and the same dismissal condition -- the OLD id leaving the device list. The widget
   // tree is not pumped here, so the dialog itself is not rendered; its inputs are.
-  test(
+  secondApp(
     'erase: a declined question writes nothing, an approved one confirms only after '
     'deletion, and the reset device comes back blank under a new id',
     () async {
@@ -1238,7 +1498,7 @@ void main() {
   // handler) confirms through the same arm as the test above, and the dialog's own
   // `dropErasedDeviceShares` drops the share. Host stub over ptys with fake flash: a
   // manifest unplug models the USB drop; no STM32 erase physics.
-  test(
+  secondApp(
     'erase cut by a power loss at every scripted point: a committed one is finished '
     'at boot and the app drops the share under the old id, an uncommitted one keeps it',
     () async {
